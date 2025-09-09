@@ -2413,16 +2413,21 @@ func (r *RecursiveDNSServer) handleQuerySuccess(msg *dns.Msg, question dns.Quest
 }
 
 func (r *RecursiveDNSServer) addEDNS0(msg *dns.Msg, validated bool, ecs *ECSOption, clientRequestedDNSSEC bool) {
-	var opt *dns.OPT
+	var cleanExtra []dns.RR
+	for _, rr := range msg.Extra {
+		if rr.Header().Rrtype != dns.TypeOPT {
+			cleanExtra = append(cleanExtra, rr)
+		}
+	}
+	msg.Extra = cleanExtra
 
-	if existingOpt := msg.IsEdns0(); existingOpt != nil {
-		opt = existingOpt
-	} else {
-		opt = new(dns.OPT)
-		opt.Hdr.Name = "."
-		opt.Hdr.Rrtype = dns.TypeOPT
-		opt.Hdr.Class = ClientBufferSize
-		msg.Extra = append(msg.Extra, opt)
+	opt := &dns.OPT{
+		Hdr: dns.RR_Header{
+			Name:   ".",
+			Rrtype: dns.TypeOPT,
+			Class:  ClientBufferSize,
+			Ttl:    0,
+		},
 	}
 
 	if r.config.Features.DNSSEC {
@@ -2435,29 +2440,17 @@ func (r *RecursiveDNSServer) addEDNS0(msg *dns.Msg, validated bool, ecs *ECSOpti
 	}
 
 	if ecs != nil {
-		hasECS := false
-		for _, option := range opt.Option {
-			if subnet, ok := option.(*dns.EDNS0_SUBNET); ok {
-				subnet.Family = ecs.Family
-				subnet.SourceNetmask = ecs.SourcePrefix
-				subnet.SourceScope = ecs.ScopePrefix
-				subnet.Address = ecs.Address
-				hasECS = true
-				break
-			}
+		ecsOption := &dns.EDNS0_SUBNET{
+			Code:          dns.EDNS0SUBNET,
+			Family:        ecs.Family,
+			SourceNetmask: ecs.SourcePrefix,
+			SourceScope:   ecs.ScopePrefix,
+			Address:       ecs.Address,
 		}
-
-		if !hasECS {
-			ecsOption := &dns.EDNS0_SUBNET{
-				Code:          dns.EDNS0SUBNET,
-				Family:        ecs.Family,
-				SourceNetmask: ecs.SourcePrefix,
-				SourceScope:   ecs.ScopePrefix,
-				Address:       ecs.Address,
-			}
-			opt.Option = append(opt.Option, ecsOption)
-		}
+		opt.Option = []dns.EDNS0{ecsOption}
 	}
+
+	msg.Extra = append(msg.Extra, opt)
 }
 
 func (r *RecursiveDNSServer) restoreOriginalDomain(msg *dns.Msg, questionName, originalDomain string) {
