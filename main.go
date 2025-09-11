@@ -2099,9 +2099,9 @@ func NewRedisDNSCache(config *ServerConfig, server *RecursiveDNSServer) (*RedisD
 		Addr:         config.Redis.Address,
 		Password:     config.Redis.Password,
 		DB:           config.Redis.Database,
-		PoolSize:     50,             // 固定值
-		MinIdleConns: 10,             // 固定值
-		MaxRetries:   3,              // 固定值
+		PoolSize:     50,              // 固定值
+		MinIdleConns: 10,              // 固定值
+		MaxRetries:   3,               // 固定值
 		PoolTimeout:  5 * time.Second, // 固定值
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
@@ -2472,15 +2472,15 @@ func (v *DNSSECValidator) ValidateResponse(response *dns.Msg, dnssecOK bool) boo
 // ==================== 查询结果结构 ====================
 
 type UpstreamResult struct {
-	Response        *dns.Msg
-	Server          *UpstreamServer
-	Error           error
-	Duration        time.Duration
-	HasTrustedIP    bool
-	HasUntrustedIP  bool
-	Trusted         bool
-	Filtered        bool
-	Validated       bool
+	Response       *dns.Msg
+	Server         *UpstreamServer
+	Error          error
+	Duration       time.Duration
+	HasTrustedIP   bool
+	HasUntrustedIP bool
+	Trusted        bool
+	Filtered       bool
+	Validated      bool
 }
 
 // ==================== 主服务器 ====================
