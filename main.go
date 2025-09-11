@@ -57,7 +57,7 @@ const (
 	MaxRetries           = 3
 	ClientBufferSize     = 1232 // 响应给客户端的buffer size
 	UpstreamBufferSize   = 4096 // 向上游查询的buffer size
-	MaxCNAMEChain        = 10
+	MaxCNAMEChain        = 16
 	RecursiveAddress     = "recursive"
 	MaxCacheKeySize      = 512
 	MaxDomainLength      = 253
@@ -1776,7 +1776,7 @@ func getDefaultConfig() *ServerConfig {
 	config.Performance.MaxConcurrency = 1000
 	config.Performance.ConnPoolSize = 100
 	config.Performance.QueryTimeout = 5
-	config.Performance.MaxRecursion = 10
+	config.Performance.MaxRecursion = 16
 	config.Performance.WorkerCount = runtime.NumCPU()
 	config.Performance.EnableDynamicPool = true
 	config.Performance.MaxPoolSize = 500
