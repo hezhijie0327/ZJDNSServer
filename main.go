@@ -1764,8 +1764,46 @@ func NewDoTClient(addr, serverName string, skipVerify bool) (*DoTClient, error) 
 
 // Exchange 执行DoT查询
 func (dc *DoTClient) Exchange(msg *dns.Msg, addr string) (*dns.Msg, error) {
-	// 直接使用已建立的TLS连接
-	return dc.client.ExchangeConn(msg, dc.conn)
+	// 手动实现DoT协议交换
+	msgData, err := msg.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("消息打包失败: %w", err)
+	}
+
+	// DoT格式：2字节长度前缀 + DNS消息
+	buf := make([]byte, 2+len(msgData))
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(msgData)))
+	copy(buf[2:], msgData)
+
+	// 发送查询
+	if _, err := dc.conn.Write(buf); err != nil {
+		return nil, fmt.Errorf("发送DoT查询失败: %w", err)
+	}
+
+	// 读取响应长度
+	lengthBuf := make([]byte, 2)
+	if _, err := io.ReadFull(dc.conn, lengthBuf); err != nil {
+		return nil, fmt.Errorf("读取响应长度失败: %w", err)
+	}
+
+	respLength := binary.BigEndian.Uint16(lengthBuf)
+	if respLength == 0 || respLength > UDPUpstreamBufferSize {
+		return nil, fmt.Errorf("响应长度异常: %d", respLength)
+	}
+
+	// 读取响应内容
+	respBuf := make([]byte, respLength)
+	if _, err := io.ReadFull(dc.conn, respBuf); err != nil {
+		return nil, fmt.Errorf("读取响应内容失败: %w", err)
+	}
+
+	// 解析响应
+	response := new(dns.Msg)
+	if err := response.Unpack(respBuf); err != nil {
+		return nil, fmt.Errorf("响应解析失败: %w", err)
+	}
+
+	return response, nil
 }
 
 // Close 关闭DoT客户端
@@ -1811,7 +1849,7 @@ func NewDoQClient(addr, serverName string, skipVerify bool) (*DoQClient, error) 
 	}
 
 	return &DoQClient{
-		conn:       &conn,
+		conn:       conn,
 		skipVerify: skipVerify,
 		serverName: serverName,
 	}, nil
@@ -1823,7 +1861,7 @@ func (dq *DoQClient) Exchange(msg *dns.Msg, addr string) (*dns.Msg, error) {
 		return nil, errors.New("DoQ连接已关闭")
 	}
 
-	conn := *dq.conn
+	conn := dq.conn
 
 	// 创建流
 	stream, err := conn.OpenStream()
