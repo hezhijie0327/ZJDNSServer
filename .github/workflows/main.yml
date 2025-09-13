@@ -57,7 +57,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./repo/${{ matrix.package }}.dockerfile
+          file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           labels: |
             org.opencontainers.image.title=${{ env.PACKAGE_NAME }}
