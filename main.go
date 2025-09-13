@@ -44,6 +44,14 @@ const (
 	RFCMaxDomainNameLength   = 253                 // RFC规定的最大域名长度
 )
 
+// DNS Padding 相关常量 (RFC 7830)
+const (
+	DNSPaddingBlockSize = 128  // RFC 7830 推荐的块大小
+	DNSPaddingFillByte  = 0x00 // RFC 7830 规定填充字节为0x00
+	DNSPaddingMinSize   = 12   // 最小DNS消息大小
+	DNSPaddingMaxSize   = 468  // 最大填充后大小(保持UDP 512字节限制)
+)
+
 // 安全连接相关常量（统一DoT/DoQ配置）
 const (
 	SecureConnIdleTimeout      = 5 * time.Minute  // 安全连接最大空闲超时时间
@@ -645,7 +653,60 @@ func (tm *TaskManager) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// ==================== ECS管理器 ====================
+// ==================== DNS Padding 管理器 ====================
+
+// PaddingManager DNS填充管理器，实现RFC 7830标准
+type PaddingManager struct {
+	enabled bool // 是否启用填充功能
+}
+
+// NewPaddingManager 创建DNS填充管理器
+func NewPaddingManager(enabled bool) *PaddingManager {
+	return &PaddingManager{
+		enabled: enabled,
+	}
+}
+
+// IsEnabled 检查是否启用填充
+func (pm *PaddingManager) IsEnabled() bool {
+	return pm.enabled
+}
+
+// CalculatePaddingSize 计算需要的填充大小（RFC 7830 Block Size Padding）
+func (pm *PaddingManager) CalculatePaddingSize(currentSize int) int {
+	if !pm.enabled || currentSize <= 0 {
+		return 0
+	}
+
+	// 确保不超过最大大小限制
+	if currentSize >= DNSPaddingMaxSize {
+		return 0
+	}
+
+	// RFC 7830 Block Size Padding: 填充到最近的块大小倍数
+	nextBlockSize := ((currentSize + DNSPaddingBlockSize - 1) / DNSPaddingBlockSize) * DNSPaddingBlockSize
+	paddingSize := nextBlockSize - currentSize
+
+	// 确保填充后不超过最大限制
+	if currentSize+paddingSize > DNSPaddingMaxSize {
+		return DNSPaddingMaxSize - currentSize
+	}
+
+	return paddingSize
+}
+
+// CreatePaddingOption 创建EDNS0 Padding选项
+func (pm *PaddingManager) CreatePaddingOption(paddingSize int) *dns.EDNS0_PADDING {
+	if paddingSize <= 0 {
+		return nil
+	}
+
+	return &dns.EDNS0_PADDING{
+		Padding: make([]byte, paddingSize), // RFC 7830: 填充字节为0x00
+	}
+}
+
+// ==================== ECS选项结构 ====================
 
 // ECSOption ECS (EDNS Client Subnet) 选项配置
 type ECSOption struct {
@@ -655,17 +716,21 @@ type ECSOption struct {
 	Address      net.IP // IP地址
 }
 
-// ECSManager ECS选项管理器，处理EDNS Client Subnet相关功能
-type ECSManager struct {
-	defaultECS *ECSOption  // 默认ECS配置
-	detector   *IPDetector // IP检测器
-	cache      sync.Map    // ECS检测结果缓存
+// ==================== EDNS管理器 ====================
+
+// EDNSManager EDNS选项管理器，统一管理ECS、Padding等EDNS选项
+type EDNSManager struct {
+	defaultECS     *ECSOption      // 默认ECS配置
+	detector       *IPDetector     // IP检测器
+	cache          sync.Map        // ECS检测结果缓存
+	paddingManager *PaddingManager // DNS填充管理器
 }
 
-// NewECSManager 初始化ECS管理器
-func NewECSManager(defaultSubnet string) (*ECSManager, error) {
-	manager := &ECSManager{
-		detector: NewIPDetector(),
+// NewEDNSManager 初始化EDNS管理器
+func NewEDNSManager(defaultSubnet string, paddingEnabled bool) (*EDNSManager, error) {
+	manager := &EDNSManager{
+		detector:       NewIPDetector(),
+		paddingManager: NewPaddingManager(paddingEnabled),
 	}
 
 	if defaultSubnet != "" {
@@ -680,16 +745,25 @@ func NewECSManager(defaultSubnet string) (*ECSManager, error) {
 		}
 	}
 
+	if paddingEnabled {
+		logf(LogInfo, "🔒 DNS Padding: 已启用 (RFC 7830, 块大小: %d字节)", DNSPaddingBlockSize)
+	}
+
 	return manager, nil
 }
 
 // GetDefaultECS 获取默认ECS配置
-func (em *ECSManager) GetDefaultECS() *ECSOption {
+func (em *EDNSManager) GetDefaultECS() *ECSOption {
 	return em.defaultECS
 }
 
+// IsPaddingEnabled 检查是否启用填充
+func (em *EDNSManager) IsPaddingEnabled() bool {
+	return em.paddingManager.IsEnabled()
+}
+
 // ParseFromDNS 从DNS消息中解析ECS选项
-func (em *ECSManager) ParseFromDNS(msg *dns.Msg) *ECSOption {
+func (em *EDNSManager) ParseFromDNS(msg *dns.Msg) *ECSOption {
 	if msg == nil {
 		return nil
 	}
@@ -714,8 +788,8 @@ func (em *ECSManager) ParseFromDNS(msg *dns.Msg) *ECSOption {
 	return nil
 }
 
-// AddToMessage 向DNS消息添加ECS选项
-func (em *ECSManager) AddToMessage(msg *dns.Msg, ecs *ECSOption, dnssecEnabled bool) {
+// AddToMessage 向DNS消息添加所有EDNS选项（ECS + Padding）
+func (em *EDNSManager) AddToMessage(msg *dns.Msg, ecs *ECSOption, dnssecEnabled bool) {
 	if msg == nil {
 		return
 	}
@@ -744,6 +818,8 @@ func (em *ECSManager) AddToMessage(msg *dns.Msg, ecs *ECSOption, dnssecEnabled b
 		opt.SetDo(true)
 	}
 
+	var options []dns.EDNS0
+
 	// 添加ECS选项
 	if ecs != nil {
 		ecsOption := &dns.EDNS0_SUBNET{
@@ -753,14 +829,32 @@ func (em *ECSManager) AddToMessage(msg *dns.Msg, ecs *ECSOption, dnssecEnabled b
 			SourceScope:   ecs.ScopePrefix,
 			Address:       ecs.Address,
 		}
-		opt.Option = []dns.EDNS0{ecsOption}
+		options = append(options, ecsOption)
 	}
 
+	// 添加Padding选项（RFC 7830：应该是最后一个选项）
+	if em.paddingManager.IsEnabled() {
+		// 计算当前消息大小（包括已有的EDNS选项）
+		tempMsg := msg.Copy()
+		opt.Option = options
+		tempMsg.Extra = append(tempMsg.Extra, opt)
+
+		currentSize := tempMsg.Len()
+		paddingSize := em.paddingManager.CalculatePaddingSize(currentSize)
+
+		if paddingOption := em.paddingManager.CreatePaddingOption(paddingSize); paddingOption != nil {
+			options = append(options, paddingOption)
+			logf(LogDebug, "🔒 DNS Padding: 消息从 %d 字节填充到 %d 字节 (+%d)",
+				currentSize, currentSize+paddingSize, paddingSize)
+		}
+	}
+
+	opt.Option = options
 	msg.Extra = append(msg.Extra, opt)
 }
 
 // parseECSConfig 解析ECS配置字符串
-func (em *ECSManager) parseECSConfig(subnet string) (*ECSOption, error) {
+func (em *EDNSManager) parseECSConfig(subnet string) (*ECSOption, error) {
 	switch strings.ToLower(subnet) {
 	case "auto":
 		return em.detectPublicIP(false, true)
@@ -791,7 +885,7 @@ func (em *ECSManager) parseECSConfig(subnet string) (*ECSOption, error) {
 }
 
 // detectPublicIP 检测公网IP地址
-func (em *ECSManager) detectPublicIP(forceIPv6, allowFallback bool) (*ECSOption, error) {
+func (em *EDNSManager) detectPublicIP(forceIPv6, allowFallback bool) (*ECSOption, error) {
 	cacheKey := fmt.Sprintf("ip_detection_%v_%v", forceIPv6, allowFallback)
 
 	// 检查缓存
@@ -880,9 +974,9 @@ type CloudflareHTTPDetector struct {
 func (g *GoogleDNSDetector) DetectIP(forceIPv6 bool) net.IP {
 	var server string
 	if forceIPv6 {
-		server = "[2001:4860:4802:32::a]:" + DNSServerPort
+		server = "[2001:4860:4802:32::a]:53"
 	} else {
-		server = "216.239.32.10:" + DNSServerPort
+		server = "216.239.32.10:53"
 	}
 
 	// 构建DNS查询
@@ -2265,18 +2359,18 @@ type QueryResult struct {
 // QueryEngine 统一的DNS查询引擎
 type QueryEngine struct {
 	resourceManager *ResourceManager       // 资源管理器
-	ecsManager      *ECSManager            // ECS管理器
+	ednsManager     *EDNSManager           // EDNS选项管理器
 	connPool        *ConnectionPoolManager // 连接池管理器
 	taskManager     *TaskManager           // 任务管理器
 	timeout         time.Duration          // 查询超时时间
 }
 
 // NewQueryEngine 创建查询引擎
-func NewQueryEngine(resourceManager *ResourceManager, ecsManager *ECSManager,
+func NewQueryEngine(resourceManager *ResourceManager, ednsManager *EDNSManager,
 	connPool *ConnectionPoolManager, taskManager *TaskManager, timeout time.Duration) *QueryEngine {
 	return &QueryEngine{
 		resourceManager: resourceManager,
-		ecsManager:      ecsManager,
+		ednsManager:     ednsManager,
 		connPool:        connPool,
 		taskManager:     taskManager,
 		timeout:         timeout,
@@ -2290,7 +2384,7 @@ func (qe *QueryEngine) BuildQuery(question dns.Question, ecs *ECSOption, dnssecE
 	msg.SetQuestion(question.Name, question.Qtype)
 	msg.RecursionDesired = recursionDesired
 
-	qe.ecsManager.AddToMessage(msg, ecs, dnssecEnabled)
+	qe.ednsManager.AddToMessage(msg, ecs, dnssecEnabled)
 
 	return msg
 }
@@ -2939,6 +3033,7 @@ type ServerConfig struct {
 			Prefetch         bool `json:"prefetch"`          // 是否启用预取
 			DNSSEC           bool `json:"dnssec"`            // 是否启用DNSSEC
 			HijackProtection bool `json:"hijack_protection"` // 是否启用劫持保护
+			Padding          bool `json:"padding"`           // 是否启用DNS Padding (RFC 7830)
 		} `json:"features"`
 	} `json:"server"`
 
@@ -3016,6 +3111,11 @@ func (cm *ConfigManager) ValidateConfig(config *ServerConfig) error {
 
 	// 验证TLS配置
 	if err := cm.validateTLSConfig(config); err != nil {
+		return err
+	}
+
+	// 验证Padding配置
+	if err := cm.validatePaddingConfig(config); err != nil {
 		return err
 	}
 
@@ -3131,6 +3231,15 @@ func (cm *ConfigManager) validateTLSConfig(config *ServerConfig) error {
 	return nil
 }
 
+// validatePaddingConfig 验证Padding配置
+func (cm *ConfigManager) validatePaddingConfig(config *ServerConfig) error {
+	if config.Server.Features.Padding {
+		logf(LogInfo, "🔒 DNS Padding: 已启用 (RFC 7830)")
+		logf(LogInfo, "🔒 填充策略: Block Size %d字节", DNSPaddingBlockSize)
+	}
+	return nil
+}
+
 // getDefaultConfig 获取默认配置
 func (cm *ConfigManager) getDefaultConfig() *ServerConfig {
 	config := &ServerConfig{}
@@ -3152,6 +3261,7 @@ func (cm *ConfigManager) getDefaultConfig() *ServerConfig {
 	config.Server.Features.Prefetch = false
 	config.Server.Features.DNSSEC = true
 	config.Server.Features.HijackProtection = false
+	config.Server.Features.Padding = false
 
 	// Redis配置
 	config.Redis.Address = ""
@@ -3201,6 +3311,7 @@ func (cm *ConfigManager) GenerateExampleConfig() string {
 	config.Server.Features.ServeStale = true
 	config.Server.Features.Prefetch = true
 	config.Server.Features.HijackProtection = true
+	config.Server.Features.Padding = false
 
 	// 示例上游服务器配置
 	config.Upstream = []UpstreamServer{
@@ -3860,7 +3971,7 @@ type RecursiveDNSServer struct {
 	wg               sync.WaitGroup         // 等待组
 	taskManager      *TaskManager           // 任务管理器
 	hijackPrevention *DNSHijackPrevention   // DNS劫持预防
-	ecsManager       *ECSManager            // ECS管理器
+	ednsManager      *EDNSManager           // EDNS选项管理器
 	queryEngine      *QueryEngine           // 查询引擎
 	secureDNSManager *SecureDNSManager      // 统一安全DNS管理器
 	closed           int32                  // 关闭状态标志
@@ -3891,25 +4002,25 @@ func (r *RecursiveDNSServer) QueryForRefresh(question dns.Question, ecs *ECSOpti
 func NewDNSServer(config *ServerConfig) (*RecursiveDNSServer, error) {
 	// 根服务器列表定义
 	rootServersV4 := []string{
-		"198.41.0.4:" + DNSServerPort, "170.247.170.2:" + DNSServerPort, "192.33.4.12:" + DNSServerPort, "199.7.91.13:" + DNSServerPort,
-		"192.203.230.10:" + DNSServerPort, "192.5.5.241:" + DNSServerPort, "192.112.36.4:" + DNSServerPort, "198.97.190.53:" + DNSServerPort,
-		"192.36.148.17:" + DNSServerPort, "192.58.128.30:" + DNSServerPort, "193.0.14.129:" + DNSServerPort, "199.7.83.42:" + DNSServerPort, "202.12.27.33:" + DNSServerPort,
+		"198.41.0.4:53", "170.247.170.2:53", "192.33.4.12:53", "199.7.91.13:53",
+		"192.203.230.10:53", "192.5.5.241:53", "192.112.36.4:53", "198.97.190.53:53",
+		"192.36.148.17:53", "192.58.128.30:53", "193.0.14.129:53", "199.7.83.42:53", "202.12.27.33:53",
 	}
 
 	rootServersV6 := []string{
-		"[2001:503:ba3e::2:30]:" + DNSServerPort, "[2801:1b8:10::b]:" + DNSServerPort, "[2001:500:2::c]:" + DNSServerPort, "[2001:500:2d::d]:" + DNSServerPort,
-		"[2001:500:a8::e]:" + DNSServerPort, "[2001:500:2f::f]:" + DNSServerPort, "[2001:500:12::d0d]:" + DNSServerPort, "[2001:500:1::53]:" + DNSServerPort,
-		"[2001:7fe::53]:" + DNSServerPort, "[2001:503:c27::2:30]:" + DNSServerPort, "[2001:7fd::1]:" + DNSServerPort, "[2001:500:9f::42]:" + DNSServerPort, "[2001:dc3::35]:" + DNSServerPort,
+		"[2001:503:ba3e::2:30]:53", "[2801:1b8:10::b]:53", "[2001:500:2::c]:53", "[2001:500:2d::d]:53",
+		"[2001:500:a8::e]:53", "[2001:500:2f::f]:53", "[2001:500:12::d0d]:53", "[2001:500:1::53]:53",
+		"[2001:7fe::53]:53", "[2001:503:c27::2:30]:53", "[2001:7fd::1]:53", "[2001:500:9f::42]:53", "[2001:dc3::35]:53",
 	}
 
 	// 创建全局上下文
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// 初始化各种组件
-	ecsManager, err := NewECSManager(config.Server.DefaultECS)
+	ednsManager, err := NewEDNSManager(config.Server.DefaultECS, config.Server.Features.Padding)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("ECS管理器初始化失败: %w", err)
+		return nil, fmt.Errorf("EDNS管理器初始化失败: %w", err)
 	}
 
 	ipFilter := NewIPFilter()
@@ -3931,7 +4042,7 @@ func NewDNSServer(config *ServerConfig) (*RecursiveDNSServer, error) {
 	upstreamManager := NewUpstreamManager(config.Upstream)
 	connPool := NewConnectionPoolManager()
 	taskManager := NewTaskManager(MaxConcurrency)
-	queryEngine := NewQueryEngine(globalResourceManager, ecsManager, connPool, taskManager, QueryTimeout)
+	queryEngine := NewQueryEngine(globalResourceManager, ednsManager, connPool, taskManager, QueryTimeout)
 	hijackPrevention := NewDNSHijackPrevention(config.Server.Features.HijackProtection)
 
 	// 创建服务器实例
@@ -3950,7 +4061,7 @@ func NewDNSServer(config *ServerConfig) (*RecursiveDNSServer, error) {
 		upstreamManager:  upstreamManager,
 		taskManager:      taskManager,
 		hijackPrevention: hijackPrevention,
-		ecsManager:       ecsManager,
+		ednsManager:      ednsManager,
 		queryEngine:      queryEngine,
 	}
 
@@ -4192,8 +4303,11 @@ func (r *RecursiveDNSServer) displayInfo() {
 	if r.config.Server.Features.HijackProtection {
 		logf(LogInfo, "🛡️ DNS劫持预防: 已启用")
 	}
-	if defaultECS := r.ecsManager.GetDefaultECS(); defaultECS != nil {
+	if defaultECS := r.ednsManager.GetDefaultECS(); defaultECS != nil {
 		logf(LogInfo, "🌍 默认ECS: %s/%d", defaultECS.Address, defaultECS.SourcePrefix)
+	}
+	if r.ednsManager.IsPaddingEnabled() {
+		logf(LogInfo, "🔒 DNS Padding: 已启用 (RFC 7830)")
 	}
 
 	// 显示性能参数
@@ -4295,7 +4409,7 @@ func (r *RecursiveDNSServer) ProcessDNSQuery(req *dns.Msg, clientIP net.IP) *dns
 
 	if opt := req.IsEdns0(); opt != nil {
 		clientRequestedDNSSEC = opt.Do()
-		ecsOpt = r.ecsManager.ParseFromDNS(req)
+		ecsOpt = r.ednsManager.ParseFromDNS(req)
 		if tracker != nil && ecsOpt != nil {
 			tracker.AddStep("客户端ECS: %s/%d", ecsOpt.Address, ecsOpt.SourcePrefix)
 		}
@@ -4303,7 +4417,7 @@ func (r *RecursiveDNSServer) ProcessDNSQuery(req *dns.Msg, clientIP net.IP) *dns
 
 	// 使用默认ECS（如果客户端未提供）
 	if ecsOpt == nil {
-		ecsOpt = r.ecsManager.GetDefaultECS()
+		ecsOpt = r.ednsManager.GetDefaultECS()
 		if tracker != nil && ecsOpt != nil {
 			tracker.AddStep("使用默认ECS: %s/%d", ecsOpt.Address, ecsOpt.SourcePrefix)
 		}
@@ -4384,10 +4498,10 @@ func (r *RecursiveDNSServer) handleCacheHit(msg *dns.Msg, entry *CacheEntry, isE
 	msg.Ns = globalRecordHandler.ProcessRecords(entry.GetAuthorityRRs(), responseTTL, clientRequestedDNSSEC)
 	msg.Extra = globalRecordHandler.ProcessRecords(entry.GetAdditionalRRs(), responseTTL, clientRequestedDNSSEC)
 
-	// 添加ECS选项
+	// 添加EDNS选项（包括ECS和Padding）
 	cachedECS := entry.GetECSOption()
 	if clientRequestedDNSSEC || cachedECS != nil {
-		r.ecsManager.AddToMessage(msg, cachedECS, entry.Validated && clientRequestedDNSSEC)
+		r.ednsManager.AddToMessage(msg, cachedECS, entry.Validated && clientRequestedDNSSEC)
 	}
 
 	// 启动后台刷新（如果需要）
@@ -4464,7 +4578,7 @@ func (r *RecursiveDNSServer) handleQueryError(msg *dns.Msg, err error, cacheKey 
 
 			cachedECS := entry.GetECSOption()
 			if clientRequestedDNSSEC || cachedECS != nil {
-				r.ecsManager.AddToMessage(msg, cachedECS, entry.Validated && clientRequestedDNSSEC)
+				r.ednsManager.AddToMessage(msg, cachedECS, entry.Validated && clientRequestedDNSSEC)
 			}
 
 			r.restoreOriginalDomain(msg, question.Name, originalDomain)
@@ -4513,9 +4627,9 @@ func (r *RecursiveDNSServer) handleQuerySuccess(msg *dns.Msg, question dns.Quest
 	msg.Ns = globalRecordHandler.FilterDNSSEC(authority, clientRequestedDNSSEC)
 	msg.Extra = globalRecordHandler.FilterDNSSEC(additional, clientRequestedDNSSEC)
 
-	// 添加ECS选项
+	// 添加EDNS选项（包括ECS和Padding）
 	if clientRequestedDNSSEC || finalECS != nil {
-		r.ecsManager.AddToMessage(msg, finalECS, validated && clientRequestedDNSSEC)
+		r.ednsManager.AddToMessage(msg, finalECS, validated && clientRequestedDNSSEC)
 	}
 
 	r.restoreOriginalDomain(msg, question.Name, originalDomain)
@@ -4631,7 +4745,7 @@ func (r *RecursiveDNSServer) queryUpstreamServer(ctx context.Context, server *Up
 		result.Validated = validated
 
 		if ecsResponse != nil {
-			r.ecsManager.AddToMessage(response, ecsResponse, serverDNSSECEnabled)
+			r.ednsManager.AddToMessage(response, ecsResponse, serverDNSSECEnabled)
 		}
 	} else {
 		// 外部服务器查询
@@ -4733,7 +4847,7 @@ func (r *RecursiveDNSServer) selectUpstreamResult(results []UpstreamResult, ques
 	// 解析ECS响应
 	var ecsResponse *ECSOption
 	if selectedResult.Response != nil {
-		ecsResponse = r.ecsManager.ParseFromDNS(selectedResult.Response)
+		ecsResponse = r.ednsManager.ParseFromDNS(selectedResult.Response)
 	}
 
 	return selectedResult.Response.Answer, selectedResult.Response.Ns, selectedResult.Response.Extra,
@@ -4871,7 +4985,7 @@ func (r *RecursiveDNSServer) recursiveQuery(ctx context.Context, question dns.Qu
 		}
 
 		var ecsResponse *ECSOption
-		ecsResponse = r.ecsManager.ParseFromDNS(response)
+		ecsResponse = r.ednsManager.ParseFromDNS(response)
 
 		return response.Answer, response.Ns, response.Extra, validated, ecsResponse, nil
 	}
@@ -4922,7 +5036,7 @@ func (r *RecursiveDNSServer) recursiveQuery(ctx context.Context, question dns.Qu
 		}
 
 		var ecsResponse *ECSOption
-		ecsResponse = r.ecsManager.ParseFromDNS(response)
+		ecsResponse = r.ednsManager.ParseFromDNS(response)
 
 		// 检查是否获得最终答案
 		if len(response.Answer) > 0 {
