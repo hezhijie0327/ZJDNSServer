@@ -44,25 +44,32 @@ const (
 	RFCMaxDomainNameLength   = 253                 // RFC规定的最大域名长度
 )
 
-// DoQ 相关常量
+// 安全连接相关常量（统一DoT/DoQ配置）
 const (
-	maxQUICIdleTimeout         = 5 * time.Minute  // QUIC最大空闲超时时间
-	quicAddrValidatorCacheSize = 1000             // QUIC地址验证器缓存大小
-	quicAddrValidatorCacheTTL  = 30 * time.Minute // QUIC地址验证器缓存TTL
-	minDNSPacketSize           = 12               // DNS数据包最小长度
-	QUICKeepAlivePeriod        = 20 * time.Second // QUIC保活周期
+	SecureConnIdleTimeout      = 5 * time.Minute  // 安全连接最大空闲超时时间
+	SecureConnKeepAlive        = 20 * time.Second // 安全连接保活周期
+	SecureConnHandshakeTimeout = 2 * time.Second  // 安全连接握手超时时间
+	SecureConnQueryTimeout     = 5 * time.Second  // 安全连接查询超时时间
+	SecureConnBufferSize       = 4096             // 安全连接缓冲区大小
+	MinDNSPacketSize           = 12               // DNS数据包最小长度
 )
 
-// DoQ 协议版本和错误码
+// QUIC协议特定常量
+const (
+	QUICAddrValidatorCacheSize = 1000             // QUIC地址验证器缓存大小
+	QUICAddrValidatorCacheTTL  = 30 * time.Minute // QUIC地址验证器缓存TTL
+)
+
+// QUIC协议版本和错误码
 var (
-	NextProtoDQ = []string{"doq", "doq-i02", "doq-i00", "dq"} // DoQ ALPN 标识符列表
+	NextProtoQUIC = []string{"doq", "doq-i02", "doq-i00", "dq"} // QUIC ALPN 标识符列表
 )
 
-// DoQ 错误码常量
+// QUIC错误码常量
 const (
-	DoQCodeNoError       quic.ApplicationErrorCode = 0 // 无错误
-	DoQCodeInternalError quic.ApplicationErrorCode = 1 // 内部错误
-	DoQCodeProtocolError quic.ApplicationErrorCode = 2 // 协议错误
+	QUICCodeNoError       quic.ApplicationErrorCode = 0 // 无错误
+	QUICCodeInternalError quic.ApplicationErrorCode = 1 // 内部错误
+	QUICCodeProtocolError quic.ApplicationErrorCode = 2 // 协议错误
 )
 
 // 缓存系统相关常量
@@ -102,7 +109,6 @@ const (
 	ExtendedQueryTimeout     = 25 * time.Second       // 扩展查询超时时间
 	ServerStartupDelay       = 100 * time.Millisecond // 服务器启动延迟
 	GracefulShutdownTimeout  = 10 * time.Second       // 优雅关闭超时时间
-	TLSHandshakeTimeout      = 2 * time.Second        // TLS握手超时时间
 	TaskExecutionTimeout     = 10 * time.Second       // 任务执行超时时间
 )
 
@@ -352,6 +358,7 @@ type ObjectPoolManager struct {
 	stringBuilders sync.Pool // 字符串构建器对象池
 	dnsMessages    sync.Pool // DNS消息对象池
 	stringMaps     sync.Pool // 字符串映射对象池
+	byteBuffers    sync.Pool // 字节缓冲池（统一安全连接使用）
 }
 
 // NewObjectPoolManager 初始化对象池管理器
@@ -371,6 +378,12 @@ func NewObjectPoolManager() *ObjectPoolManager {
 		stringMaps: sync.Pool{
 			New: func() interface{} {
 				return make(map[string]bool, MapInitialCapacity)
+			},
+		},
+		byteBuffers: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, SecureConnBufferSize)
+				return &buf
 			},
 		},
 	}
@@ -425,6 +438,20 @@ func (pm *ObjectPoolManager) GetDNSMessage() *dns.Msg {
 // msg: 要归还的DNS消息
 func (pm *ObjectPoolManager) PutDNSMessage(msg *dns.Msg) {
 	pm.dnsMessages.Put(msg)
+}
+
+// GetByteBuffer 从对象池获取字节缓冲区
+// 返回: 字节缓冲区
+func (pm *ObjectPoolManager) GetByteBuffer() *[]byte {
+	return pm.byteBuffers.Get().(*[]byte)
+}
+
+// PutByteBuffer 将字节缓冲区归还到对象池
+// buf: 要归还的字节缓冲区
+func (pm *ObjectPoolManager) PutByteBuffer(buf *[]byte) {
+	if buf != nil && len(*buf) <= SecureConnBufferSize*2 {
+		pm.byteBuffers.Put(buf)
+	}
 }
 
 // globalPoolManager 全局对象池管理器实例
@@ -887,7 +914,7 @@ func (c *CloudflareHTTPDetector) DetectIP(forceIPv6 bool) net.IP {
 			}
 			return dialer.DialContext(ctx, "tcp4", addr)
 		},
-		TLSHandshakeTimeout: TLSHandshakeTimeout,
+		TLSHandshakeTimeout: SecureConnHandshakeTimeout,
 	}
 
 	client := &http.Client{
@@ -953,7 +980,7 @@ func NewIPDetector() *IPDetector {
 				DialContext: (&net.Dialer{
 					Timeout: PublicIPDetectionTimeout,
 				}).DialContext,
-				TLSHandshakeTimeout: TLSHandshakeTimeout,
+				TLSHandshakeTimeout: SecureConnHandshakeTimeout,
 			},
 		},
 	}
@@ -1200,333 +1227,32 @@ func (drp *DNSRecordProcessor) ProcessRecords(rrs []dns.RR, ttl uint32, includeD
 // globalRecordProcessor 全局DNS记录处理器实例
 var globalRecordProcessor = &DNSRecordProcessor{}
 
-// ==================== 扩展连接池（支持DoT/DoQ客户端） ====================
+// ==================== 统一安全连接错误处理器 ====================
 
-// SecureClient 安全DNS客户端接口
-type SecureClient interface {
-	Exchange(msg *dns.Msg, addr string) (*dns.Msg, error)
-	Close() error
+// SecureConnErrorHandler 统一的安全连接错误处理器
+type SecureConnErrorHandler struct{}
+
+// IsRetryableError 判断是否为可重试的安全连接错误
+// protocol: 协议类型 ("tls" 或 "quic")
+// err: 错误信息
+// 返回: 是否为可重试错误
+func (h *SecureConnErrorHandler) IsRetryableError(protocol string, err error) bool {
+	if err == nil {
+		return false
+	}
+
+	switch strings.ToLower(protocol) {
+	case "quic":
+		return h.isQUICRetryableError(err)
+	case "tls":
+		return h.isTLSRetryableError(err)
+	default:
+		return false
+	}
 }
 
-// DoTClient DoT客户端实现
-type DoTClient struct {
-	client     *dns.Client
-	conn       *tls.Conn
-	skipVerify bool
-	serverName string
-}
-
-// NewDoTClient 创建DoT客户端
-func NewDoTClient(addr, serverName string, skipVerify bool) (*DoTClient, error) {
-	// 解析地址
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("解析DoT地址失败: %w", err)
-	}
-
-	// 建立TLS连接
-	tlsConfig := &tls.Config{
-		ServerName:         serverName,
-		InsecureSkipVerify: skipVerify,
-	}
-
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: TLSHandshakeTimeout}, "tcp", net.JoinHostPort(host, port), tlsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("DoT连接失败: %w", err)
-	}
-
-	client := &dns.Client{
-		Net:     "tcp-tls",
-		Timeout: QueryTimeout,
-	}
-
-	return &DoTClient{
-		client:     client,
-		conn:       conn,
-		skipVerify: skipVerify,
-		serverName: serverName,
-	}, nil
-}
-
-// Exchange 执行DoT查询
-func (dc *DoTClient) Exchange(msg *dns.Msg, addr string) (*dns.Msg, error) {
-	// 手动实现DoT协议交换
-	msgData, err := msg.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("消息打包失败: %w", err)
-	}
-
-	// DoT格式：2字节长度前缀 + DNS消息
-	buf := make([]byte, 2+len(msgData))
-	binary.BigEndian.PutUint16(buf[:2], uint16(len(msgData)))
-	copy(buf[2:], msgData)
-
-	// 发送查询
-	if _, err := dc.conn.Write(buf); err != nil {
-		return nil, fmt.Errorf("发送DoT查询失败: %w", err)
-	}
-
-	// 读取响应长度
-	lengthBuf := make([]byte, 2)
-	if _, err := io.ReadFull(dc.conn, lengthBuf); err != nil {
-		return nil, fmt.Errorf("读取响应长度失败: %w", err)
-	}
-
-	respLength := binary.BigEndian.Uint16(lengthBuf)
-	if respLength == 0 || respLength > UDPUpstreamBufferSize {
-		return nil, fmt.Errorf("响应长度异常: %d", respLength)
-	}
-
-	// 读取响应内容
-	respBuf := make([]byte, respLength)
-	if _, err := io.ReadFull(dc.conn, respBuf); err != nil {
-		return nil, fmt.Errorf("读取响应内容失败: %w", err)
-	}
-
-	// 解析响应
-	response := new(dns.Msg)
-	if err := response.Unpack(respBuf); err != nil {
-		return nil, fmt.Errorf("响应解析失败: %w", err)
-	}
-
-	return response, nil
-}
-
-// Close 关闭DoT客户端
-func (dc *DoTClient) Close() error {
-	if dc.conn != nil {
-		return dc.conn.Close()
-	}
-	return nil
-}
-
-// DoQClient DoQ客户端实现（修复版本）
-type DoQClient struct {
-	conn        *quic.Conn
-	skipVerify  bool
-	serverName  string
-	timeout     time.Duration
-	bytesPool   *sync.Pool // 字节缓冲池
-	connMu      sync.Mutex // 连接保护锁
-	isConnected bool       // 连接状态
-}
-
-// NewDoQClient 创建DoQ客户端
-func NewDoQClient(addr, serverName string, skipVerify bool) (*DoQClient, error) {
-	// 解析地址
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("解析DoQ地址失败: %w", err)
-	}
-
-	client := &DoQClient{
-		skipVerify: skipVerify,
-		serverName: serverName,
-		timeout:    QueryTimeout,
-		bytesPool: &sync.Pool{
-			New: func() interface{} {
-				buf := make([]byte, dns.MaxMsgSize)
-				return &buf
-			},
-		},
-	}
-
-	// 建立QUIC连接
-	if err := client.connect(net.JoinHostPort(host, port)); err != nil {
-		return nil, err
-	}
-
-	return client, nil
-}
-
-// connect 建立QUIC连接
-func (dq *DoQClient) connect(addr string) error {
-	dq.connMu.Lock()
-	defer dq.connMu.Unlock()
-
-	if dq.isConnected && dq.conn != nil {
-		return nil
-	}
-
-	// 建立QUIC连接
-	tlsConfig := &tls.Config{
-		ServerName:         dq.serverName,
-		InsecureSkipVerify: dq.skipVerify,
-		NextProtos:         NextProtoDQ,
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), dq.timeout)
-	defer cancel()
-
-	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:        maxQUICIdleTimeout,
-		MaxIncomingStreams:    math.MaxUint16,
-		MaxIncomingUniStreams: math.MaxUint16,
-		KeepAlivePeriod:       QUICKeepAlivePeriod, // 根据 dnsproxy 设置
-		Allow0RTT:             true,
-	})
-	if err != nil {
-		return fmt.Errorf("DoQ连接失败: %w", err)
-	}
-
-	dq.conn = conn
-	dq.isConnected = true
-	return nil
-}
-
-// Exchange 执行DoQ查询（修复版本）
-func (dq *DoQClient) Exchange(msg *dns.Msg, addr string) (*dns.Msg, error) {
-	// 保存原始ID并设置为0（根据DoQ规范）
-	originalID := msg.Id
-	msg.Id = 0
-	defer func() {
-		msg.Id = originalID
-	}()
-
-	// 尝试查询，如果失败则重试一次
-	resp, err := dq.exchangeWithRetry(msg, addr)
-	if resp != nil {
-		resp.Id = originalID // 恢复原始ID
-	}
-	return resp, err
-}
-
-// exchangeWithRetry 带重试机制的查询
-func (dq *DoQClient) exchangeWithRetry(msg *dns.Msg, addr string) (*dns.Msg, error) {
-	conn, cached, err := dq.getConnection()
-	if err != nil {
-		return nil, fmt.Errorf("获取连接失败: %w", err)
-	}
-
-	// 第一次尝试
-	resp, err := dq.exchangeQUIC(msg, conn)
-
-	// 如果是缓存连接且失败了，重试一次
-	if cached && err != nil && dq.isQUICRetryError(err) {
-		logf(LogDebug, "DoQ连接失败，重新建立连接: %v", err)
-
-		// 关闭旧连接
-		dq.closeConnWithError(conn, err)
-
-		// 重新获取连接
-		conn, _, err = dq.getConnection()
-		if err != nil {
-			return nil, fmt.Errorf("重新建立连接失败: %w", err)
-		}
-
-		// 重试查询
-		resp, err = dq.exchangeQUIC(msg, conn)
-	}
-
-	if err != nil {
-		dq.closeConnWithError(conn, err)
-	}
-
-	return resp, err
-}
-
-// getConnection 获取或创建连接
-func (dq *DoQClient) getConnection() (*quic.Conn, bool, error) {
-	dq.connMu.Lock()
-	defer dq.connMu.Unlock()
-
-	if dq.conn != nil && dq.isConnected {
-		return dq.conn, true, nil
-	}
-
-	// 需要重新连接
-	dq.isConnected = false
-	return dq.conn, false, fmt.Errorf("连接已断开，需要重新建立")
-}
-
-// exchangeQUIC 执行QUIC查询
-func (dq *DoQClient) exchangeQUIC(msg *dns.Msg, conn *quic.Conn) (*dns.Msg, error) {
-	if conn == nil {
-		return nil, errors.New("DoQ连接为空")
-	}
-
-	// 打包查询消息
-	msgData, err := msg.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("消息打包失败: %w", err)
-	}
-
-	// 创建流
-	ctx, cancel := context.WithTimeout(context.Background(), dq.timeout)
-	defer cancel()
-
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("创建DoQ流失败: %w", err)
-	}
-	defer stream.Close()
-
-	// 设置流超时
-	if dq.timeout > 0 {
-		if err := stream.SetDeadline(time.Now().Add(dq.timeout)); err != nil {
-			return nil, fmt.Errorf("设置流超时失败: %w", err)
-		}
-	}
-
-	// DoQ v1 格式：2字节长度前缀 + DNS消息
-	buf := make([]byte, 2+len(msgData))
-	binary.BigEndian.PutUint16(buf[:2], uint16(len(msgData)))
-	copy(buf[2:], msgData)
-
-	// 发送查询
-	_, err = stream.Write(buf)
-	if err != nil {
-		return nil, fmt.Errorf("发送DoQ查询失败: %w", err)
-	}
-
-	// 关闭写方向（DoQ协议要求）
-	if err := stream.Close(); err != nil {
-		logf(LogDebug, "关闭DoQ流写方向失败: %v", err)
-	}
-
-	// 读取响应
-	return dq.readMsg(stream)
-}
-
-// readMsg 从流中读取DNS响应
-func (dq *DoQClient) readMsg(stream *quic.Stream) (*dns.Msg, error) {
-	// 从池中获取缓冲区
-	bufPtr := dq.bytesPool.Get().(*[]byte)
-	defer dq.bytesPool.Put(bufPtr)
-
-	respBuf := *bufPtr
-
-	// 读取响应数据
-	n, err := stream.Read(respBuf)
-	if err != nil && n == 0 {
-		return nil, fmt.Errorf("读取DoQ响应失败: %w", err)
-	}
-
-	// 取消读取（防止阻塞）
-	stream.CancelRead(0)
-
-	// 检查最小长度
-	if n < 2 {
-		return nil, fmt.Errorf("DoQ响应太短: %d字节", n)
-	}
-
-	// 验证长度前缀
-	msgLen := binary.BigEndian.Uint16(respBuf[:2])
-	if int(msgLen) != n-2 {
-		logf(LogDebug, "DoQ响应长度不匹配: 声明=%d, 实际=%d", msgLen, n-2)
-	}
-
-	// 解析DNS消息（跳过2字节长度前缀）
-	response := new(dns.Msg)
-	if err := response.Unpack(respBuf[2:n]); err != nil {
-		return nil, fmt.Errorf("DoQ响应解析失败: %w", err)
-	}
-
-	return response, nil
-}
-
-// isQUICRetryError 判断是否为可重试的QUIC错误
-func (dq *DoQClient) isQUICRetryError(err error) bool {
+// isQUICRetryableError 判断是否为可重试的QUIC错误
+func (h *SecureConnErrorHandler) isQUICRetryableError(err error) bool {
 	// 应用层错误
 	var qAppErr *quic.ApplicationError
 	if errors.As(err, &qAppErr) {
@@ -1565,47 +1291,359 @@ func (dq *DoQClient) isQUICRetryError(err error) bool {
 	return false
 }
 
-// closeConnWithError 关闭连接（带错误处理）
-func (dq *DoQClient) closeConnWithError(conn *quic.Conn, err error) {
-	dq.connMu.Lock()
-	defer dq.connMu.Unlock()
-
-	if conn == nil {
-		return
+// isTLSRetryableError 判断是否为可重试的TLS错误
+func (h *SecureConnErrorHandler) isTLSRetryableError(err error) bool {
+	// 超时错误
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
 	}
 
-	code := DoQCodeNoError
+	// 连接被重置
+	if strings.Contains(err.Error(), "connection reset") {
+		return true
+	}
+
+	// EOF错误
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+
+	return false
+}
+
+// globalSecureConnErrorHandler 全局安全连接错误处理器实例
+var globalSecureConnErrorHandler = &SecureConnErrorHandler{}
+
+// ==================== 简化的安全连接客户端 ====================
+
+// SecureClient 安全DNS客户端接口（简化版）
+type SecureClient interface {
+	Exchange(msg *dns.Msg, addr string) (*dns.Msg, error)
+	Close() error
+}
+
+// UnifiedSecureClient 统一的安全连接客户端实现
+type UnifiedSecureClient struct {
+	protocol   string        // 协议类型: "tls" 或 "quic"
+	serverName string        // 服务器名称
+	skipVerify bool          // 是否跳过TLS验证
+	timeout    time.Duration // 超时时间
+
+	// TLS相关
+	tlsConn *tls.Conn
+
+	// QUIC相关
+	quicConn        *quic.Conn
+	isQUICConnected bool
+
+	// 通用配置
+	mu sync.Mutex // 连接保护锁
+}
+
+// NewUnifiedSecureClient 创建统一的安全连接客户端
+// protocol: 协议类型 ("tls" 或 "quic")
+// addr: 服务器地址
+// serverName: 服务器名称
+// skipVerify: 是否跳过TLS验证
+// 返回: 安全连接客户端实例和可能的错误
+func NewUnifiedSecureClient(protocol, addr, serverName string, skipVerify bool) (*UnifiedSecureClient, error) {
+	client := &UnifiedSecureClient{
+		protocol:   strings.ToLower(protocol),
+		serverName: serverName,
+		skipVerify: skipVerify,
+		timeout:    SecureConnQueryTimeout,
+	}
+
+	// 建立连接
+	if err := client.connect(addr); err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+// connect 建立安全连接
+func (c *UnifiedSecureClient) connect(addr string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 解析地址
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		code = DoQCodeInternalError
+		return fmt.Errorf("解析地址失败: %w", err)
 	}
 
-	// 关闭连接
-	if closeErr := conn.CloseWithError(code, ""); closeErr != nil {
-		logf(LogDebug, "关闭DoQ连接失败: %v", closeErr)
-	}
-
-	// 如果是当前连接，清除缓存
-	if dq.conn == conn {
-		dq.conn = nil
-		dq.isConnected = false
+	switch c.protocol {
+	case "tls":
+		return c.connectTLS(host, port)
+	case "quic":
+		return c.connectQUIC(net.JoinHostPort(host, port))
+	default:
+		return fmt.Errorf("不支持的协议: %s", c.protocol)
 	}
 }
 
-// Close 关闭DoQ客户端
-func (dq *DoQClient) Close() error {
-	dq.connMu.Lock()
-	defer dq.connMu.Unlock()
+// connectTLS 建立TLS连接
+func (c *UnifiedSecureClient) connectTLS(host, port string) error {
+	tlsConfig := &tls.Config{
+		ServerName:         c.serverName,
+		InsecureSkipVerify: c.skipVerify,
+	}
 
-	if dq.conn != nil {
-		err := dq.conn.CloseWithError(DoQCodeNoError, "")
-		dq.conn = nil
-		dq.isConnected = false
-		return err
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: SecureConnHandshakeTimeout}, "tcp", net.JoinHostPort(host, port), tlsConfig)
+	if err != nil {
+		return fmt.Errorf("TLS连接失败: %w", err)
+	}
+
+	c.tlsConn = conn
+	return nil
+}
+
+// connectQUIC 建立QUIC连接
+func (c *UnifiedSecureClient) connectQUIC(addr string) error {
+	tlsConfig := &tls.Config{
+		ServerName:         c.serverName,
+		InsecureSkipVerify: c.skipVerify,
+		NextProtos:         NextProtoQUIC,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
+		MaxIdleTimeout:        SecureConnIdleTimeout,
+		MaxIncomingStreams:    math.MaxUint16,
+		MaxIncomingUniStreams: math.MaxUint16,
+		KeepAlivePeriod:       SecureConnKeepAlive,
+		Allow0RTT:             true,
+	})
+	if err != nil {
+		return fmt.Errorf("QUIC连接失败: %w", err)
+	}
+
+	c.quicConn = conn
+	c.isQUICConnected = true
+	return nil
+}
+
+// Exchange 执行安全DNS查询
+func (c *UnifiedSecureClient) Exchange(msg *dns.Msg, addr string) (*dns.Msg, error) {
+	switch c.protocol {
+	case "tls":
+		return c.exchangeTLS(msg)
+	case "quic":
+		return c.exchangeQUIC(msg)
+	default:
+		return nil, fmt.Errorf("不支持的协议: %s", c.protocol)
+	}
+}
+
+// exchangeTLS 执行TLS查询
+func (c *UnifiedSecureClient) exchangeTLS(msg *dns.Msg) (*dns.Msg, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.tlsConn == nil {
+		return nil, errors.New("TLS连接未建立")
+	}
+
+	// 打包查询消息
+	msgData, err := msg.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("消息打包失败: %w", err)
+	}
+
+	// TLS格式：2字节长度前缀 + DNS消息
+	buf := make([]byte, 2+len(msgData))
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(msgData)))
+	copy(buf[2:], msgData)
+
+	// 发送查询
+	if _, err := c.tlsConn.Write(buf); err != nil {
+		return nil, fmt.Errorf("发送TLS查询失败: %w", err)
+	}
+
+	// 读取响应长度
+	lengthBuf := make([]byte, 2)
+	if _, err := io.ReadFull(c.tlsConn, lengthBuf); err != nil {
+		return nil, fmt.Errorf("读取响应长度失败: %w", err)
+	}
+
+	respLength := binary.BigEndian.Uint16(lengthBuf)
+	if respLength == 0 || respLength > UDPUpstreamBufferSize {
+		return nil, fmt.Errorf("响应长度异常: %d", respLength)
+	}
+
+	// 读取响应内容
+	respBuf := make([]byte, respLength)
+	if _, err := io.ReadFull(c.tlsConn, respBuf); err != nil {
+		return nil, fmt.Errorf("读取响应内容失败: %w", err)
+	}
+
+	// 解析响应
+	response := new(dns.Msg)
+	if err := response.Unpack(respBuf); err != nil {
+		return nil, fmt.Errorf("响应解析失败: %w", err)
+	}
+
+	return response, nil
+}
+
+// exchangeQUIC 执行QUIC查询
+func (c *UnifiedSecureClient) exchangeQUIC(msg *dns.Msg) (*dns.Msg, error) {
+	// 保存原始ID并设置为0（根据DoQ规范）
+	originalID := msg.Id
+	msg.Id = 0
+	defer func() {
+		msg.Id = originalID
+	}()
+
+	// 尝试查询，如果失败则重试一次
+	resp, err := c.exchangeQUICWithRetry(msg)
+	if resp != nil {
+		resp.Id = originalID // 恢复原始ID
+	}
+	return resp, err
+}
+
+// exchangeQUICWithRetry 带重试机制的QUIC查询
+func (c *UnifiedSecureClient) exchangeQUICWithRetry(msg *dns.Msg) (*dns.Msg, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.quicConn == nil || !c.isQUICConnected {
+		return nil, errors.New("QUIC连接未建立")
+	}
+
+	// 第一次尝试
+	resp, err := c.exchangeQUICDirect(msg)
+
+	// 如果失败且可重试，重新连接并重试
+	if err != nil && globalSecureConnErrorHandler.IsRetryableError("quic", err) {
+		logf(LogDebug, "QUIC连接失败，重新建立连接: %v", err)
+
+		// 关闭旧连接
+		c.closeQUICConn()
+
+		// 这里简化处理，实际应用中可能需要重新获取地址
+		return nil, fmt.Errorf("QUIC连接失败需要重新建立: %w", err)
+	}
+
+	return resp, err
+}
+
+// exchangeQUICDirect 直接执行QUIC查询
+func (c *UnifiedSecureClient) exchangeQUICDirect(msg *dns.Msg) (*dns.Msg, error) {
+	// 打包查询消息
+	msgData, err := msg.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("消息打包失败: %w", err)
+	}
+
+	// 创建流
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	stream, err := c.quicConn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("创建QUIC流失败: %w", err)
+	}
+	defer stream.Close()
+
+	// 设置流超时
+	if c.timeout > 0 {
+		if err := stream.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+			return nil, fmt.Errorf("设置流超时失败: %w", err)
+		}
+	}
+
+	// QUIC格式：2字节长度前缀 + DNS消息
+	buf := make([]byte, 2+len(msgData))
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(msgData)))
+	copy(buf[2:], msgData)
+
+	// 发送查询
+	_, err = stream.Write(buf)
+	if err != nil {
+		return nil, fmt.Errorf("发送QUIC查询失败: %w", err)
+	}
+
+	// 关闭写方向（QUIC协议要求）
+	if err := stream.Close(); err != nil {
+		logf(LogDebug, "关闭QUIC流写方向失败: %v", err)
+	}
+
+	// 读取响应
+	return c.readQUICMsg(stream)
+}
+
+// readQUICMsg 从QUIC流中读取DNS响应
+func (c *UnifiedSecureClient) readQUICMsg(stream *quic.Stream) (*dns.Msg, error) {
+	// 从对象池获取缓冲区
+	bufPtr := globalPoolManager.GetByteBuffer()
+	defer globalPoolManager.PutByteBuffer(bufPtr)
+
+	respBuf := *bufPtr
+
+	// 读取响应数据
+	n, err := stream.Read(respBuf)
+	if err != nil && n == 0 {
+		return nil, fmt.Errorf("读取QUIC响应失败: %w", err)
+	}
+
+	// 取消读取（防止阻塞）
+	stream.CancelRead(0)
+
+	// 检查最小长度
+	if n < 2 {
+		return nil, fmt.Errorf("QUIC响应太短: %d字节", n)
+	}
+
+	// 验证长度前缀
+	msgLen := binary.BigEndian.Uint16(respBuf[:2])
+	if int(msgLen) != n-2 {
+		logf(LogDebug, "QUIC响应长度不匹配: 声明=%d, 实际=%d", msgLen, n-2)
+	}
+
+	// 解析DNS消息（跳过2字节长度前缀）
+	response := new(dns.Msg)
+	if err := response.Unpack(respBuf[2:n]); err != nil {
+		return nil, fmt.Errorf("QUIC响应解析失败: %w", err)
+	}
+
+	return response, nil
+}
+
+// closeQUICConn 关闭QUIC连接
+func (c *UnifiedSecureClient) closeQUICConn() {
+	if c.quicConn != nil {
+		c.quicConn.CloseWithError(QUICCodeNoError, "")
+		c.quicConn = nil
+		c.isQUICConnected = false
+	}
+}
+
+// Close 关闭安全连接客户端
+func (c *UnifiedSecureClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch c.protocol {
+	case "tls":
+		if c.tlsConn != nil {
+			err := c.tlsConn.Close()
+			c.tlsConn = nil
+			return err
+		}
+	case "quic":
+		c.closeQUICConn()
 	}
 	return nil
 }
 
-// ConnectionPool 扩展的连接池，支持UDP/TCP/DoT/DoQ
+// ==================== 扩展连接池（简化版） ====================
+
+// ConnectionPool 扩展的连接池，支持UDP/TCP/TLS/QUIC
 type ConnectionPool struct {
 	clients       chan *dns.Client        // UDP客户端池
 	secureClients map[string]SecureClient // 安全客户端缓存
@@ -1655,7 +1693,7 @@ func (cp *ConnectionPool) GetTCP() *dns.Client {
 	}
 }
 
-// GetSecure 获取安全DNS客户端（DoT/DoQ）
+// GetSecure 获取安全DNS客户端（TLS/QUIC）
 func (cp *ConnectionPool) GetSecure(protocol, addr, serverName string, skipVerify bool) (SecureClient, error) {
 	cacheKey := fmt.Sprintf("%s:%s:%s:%v", protocol, addr, serverName, skipVerify)
 
@@ -1667,18 +1705,7 @@ func (cp *ConnectionPool) GetSecure(protocol, addr, serverName string, skipVerif
 	cp.mu.RUnlock()
 
 	// 创建新的安全客户端
-	var client SecureClient
-	var err error
-
-	switch strings.ToLower(protocol) {
-	case "dot":
-		client, err = NewDoTClient(addr, serverName, skipVerify)
-	case "doq":
-		client, err = NewDoQClient(addr, serverName, skipVerify)
-	default:
-		return nil, fmt.Errorf("不支持的安全协议: %s", protocol)
-	}
-
+	client, err := NewUnifiedSecureClient(protocol, addr, serverName, skipVerify)
 	if err != nil {
 		return nil, err
 	}
@@ -1724,9 +1751,9 @@ func (cp *ConnectionPool) Close() error {
 	return nil
 }
 
-// ==================== 统一安全DNS服务器管理器 ====================
+// ==================== 统一安全DNS服务器管理器（简化版） ====================
 
-// SecureDNSManager 统一管理 DoT 和 DoQ 服务器
+// SecureDNSManager 统一管理 TLS 和 QUIC 服务器
 type SecureDNSManager struct {
 	server    *RecursiveDNSServer // DNS服务器实例
 	tlsConfig *tls.Config         // TLS配置
@@ -1734,14 +1761,14 @@ type SecureDNSManager struct {
 	cancel    context.CancelFunc  // 取消函数
 	wg        sync.WaitGroup      // 等待组
 
-	// DoT 相关
-	dotListener net.Listener // DoT监听器
+	// TLS 相关
+	tlsListener net.Listener // TLS监听器
 
-	// DoQ 相关
+	// QUIC 相关
 	quicConn      *net.UDPConn        // QUIC连接
 	quicListener  *quic.EarlyListener // QUIC监听器
 	quicTransport *quic.Transport     // QUIC传输
-	validator     gcache.Cache        // QUIC地址验证缓存（内嵌简化）
+	validator     gcache.Cache        // QUIC地址验证缓存
 }
 
 // NewSecureDNSManager 创建统一安全DNS管理器
@@ -1773,22 +1800,22 @@ func NewSecureDNSManager(server *RecursiveDNSServer, config *ServerConfig) (*Sec
 		tlsConfig: tlsConfig,
 		ctx:       ctx,
 		cancel:    cancel,
-		validator: gcache.New(quicAddrValidatorCacheSize).LRU().Build(), // 内嵌QUIC验证器
+		validator: gcache.New(QUICAddrValidatorCacheSize).LRU().Build(),
 	}, nil
 }
 
-// Start 启动 DoT 和 DoQ 服务器
+// Start 启动 TLS 和 QUIC 服务器
 func (sm *SecureDNSManager) Start() error {
 	var startErrors []error
 
-	// 启动 DoT 服务器
-	if err := sm.startDoT(); err != nil {
-		startErrors = append(startErrors, fmt.Errorf("DoT启动失败: %w", err))
+	// 启动 TLS 服务器
+	if err := sm.startTLSServer(); err != nil {
+		startErrors = append(startErrors, fmt.Errorf("TLS启动失败: %w", err))
 	}
 
-	// 启动 DoQ 服务器
-	if err := sm.startDoQ(); err != nil {
-		startErrors = append(startErrors, fmt.Errorf("DoQ启动失败: %w", err))
+	// 启动 QUIC 服务器
+	if err := sm.startQUICServer(); err != nil {
+		startErrors = append(startErrors, fmt.Errorf("QUIC启动失败: %w", err))
 	}
 
 	if len(startErrors) > 0 {
@@ -1798,28 +1825,28 @@ func (sm *SecureDNSManager) Start() error {
 	return nil
 }
 
-// startDoT 启动 DoT 服务器
-func (sm *SecureDNSManager) startDoT() error {
+// startTLSServer 启动 TLS 服务器
+func (sm *SecureDNSManager) startTLSServer() error {
 	listener, err := net.Listen("tcp", ":"+sm.server.config.Server.TLS.Port)
 	if err != nil {
-		return fmt.Errorf("DoT监听失败: %w", err)
+		return fmt.Errorf("TLS监听失败: %w", err)
 	}
 
-	sm.dotListener = tls.NewListener(listener, sm.tlsConfig)
-	logf(LogInfo, "🔐 DoT服务器启动: %s", sm.dotListener.Addr())
+	sm.tlsListener = tls.NewListener(listener, sm.tlsConfig)
+	logf(LogInfo, "🔐 TLS服务器启动: %s", sm.tlsListener.Addr())
 
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
-		defer recoverPanic("DoT服务器")
-		sm.handleDoTConnections()
+		defer recoverPanic("TLS服务器")
+		sm.handleTLSConnections()
 	}()
 
 	return nil
 }
 
-// startDoQ 启动 DoQ 服务器
-func (sm *SecureDNSManager) startDoQ() error {
+// startQUICServer 启动 QUIC 服务器
+func (sm *SecureDNSManager) startQUICServer() error {
 	addr := ":" + sm.server.config.Server.TLS.Port
 
 	// 创建 UDP 连接
@@ -1836,16 +1863,16 @@ func (sm *SecureDNSManager) startDoQ() error {
 	// 创建 QUIC Transport
 	sm.quicTransport = &quic.Transport{
 		Conn:                sm.quicConn,
-		VerifySourceAddress: sm.requiresValidation, // 使用内嵌的验证方法
+		VerifySourceAddress: sm.requiresValidation,
 	}
 
-	// 创建 DoQ TLS 配置
+	// 创建 QUIC TLS 配置
 	quicTLSConfig := sm.tlsConfig.Clone()
-	quicTLSConfig.NextProtos = NextProtoDQ
+	quicTLSConfig.NextProtos = NextProtoQUIC
 
 	// 创建 QUIC 监听器
 	quicConfig := &quic.Config{
-		MaxIdleTimeout:        maxQUICIdleTimeout,
+		MaxIdleTimeout:        SecureConnIdleTimeout,
 		MaxIncomingStreams:    math.MaxUint16,
 		MaxIncomingUniStreams: math.MaxUint16,
 		Allow0RTT:             true,
@@ -1857,36 +1884,35 @@ func (sm *SecureDNSManager) startDoQ() error {
 		return fmt.Errorf("QUIC监听失败: %w", err)
 	}
 
-	logf(LogInfo, "🚀 DoQ服务器启动: %s", sm.quicListener.Addr())
+	logf(LogInfo, "🚀 QUIC服务器启动: %s", sm.quicListener.Addr())
 
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
-		defer recoverPanic("DoQ服务器")
-		sm.handleDoQConnections()
+		defer recoverPanic("QUIC服务器")
+		sm.handleQUICConnections()
 	}()
 
 	return nil
 }
 
-// requiresValidation QUIC地址验证（内嵌实现）
+// requiresValidation QUIC地址验证
 func (sm *SecureDNSManager) requiresValidation(addr net.Addr) bool {
 	key := addr.(*net.UDPAddr).IP.String()
 	if sm.validator.Has(key) {
 		return false
 	}
 
-	err := sm.validator.SetWithExpire(key, true, quicAddrValidatorCacheTTL)
+	err := sm.validator.SetWithExpire(key, true, QUICAddrValidatorCacheTTL)
 	if err != nil {
-		// 不应该发生，但为了安全起见
 		logf(LogWarn, "QUIC验证器缓存设置失败: %v", err)
 	}
 
 	return true
 }
 
-// handleDoTConnections 处理 DoT 连接
-func (sm *SecureDNSManager) handleDoTConnections() {
+// handleTLSConnections 处理 TLS 连接
+func (sm *SecureDNSManager) handleTLSConnections() {
 	for {
 		select {
 		case <-sm.ctx.Done():
@@ -1894,27 +1920,27 @@ func (sm *SecureDNSManager) handleDoTConnections() {
 		default:
 		}
 
-		conn, err := sm.dotListener.Accept()
+		conn, err := sm.tlsListener.Accept()
 		if err != nil {
 			if sm.ctx.Err() != nil {
 				return
 			}
-			logf(LogError, "DoT连接接受失败: %v", err)
+			logf(LogError, "TLS连接接受失败: %v", err)
 			continue
 		}
 
 		sm.wg.Add(1)
 		go func() {
 			defer sm.wg.Done()
-			defer recoverPanic("DoT连接处理")
+			defer recoverPanic("TLS连接处理")
 			defer conn.Close()
-			sm.handleSecureDNSConnection(conn, "DoT")
+			sm.handleSecureDNSConnection(conn, "TLS")
 		}()
 	}
 }
 
-// handleDoQConnections 处理 DoQ 连接
-func (sm *SecureDNSManager) handleDoQConnections() {
+// handleQUICConnections 处理 QUIC 连接
+func (sm *SecureDNSManager) handleQUICConnections() {
 	for {
 		select {
 		case <-sm.ctx.Done():
@@ -1934,7 +1960,7 @@ func (sm *SecureDNSManager) handleDoQConnections() {
 		sm.wg.Add(1)
 		go func() {
 			defer sm.wg.Done()
-			defer recoverPanic("DoQ连接处理")
+			defer recoverPanic("QUIC连接处理")
 			sm.handleQUICConnection(conn)
 		}()
 	}
@@ -1943,7 +1969,7 @@ func (sm *SecureDNSManager) handleDoQConnections() {
 // handleQUICConnection 处理 QUIC 连接
 func (sm *SecureDNSManager) handleQUICConnection(conn *quic.Conn) {
 	defer func() {
-		conn.CloseWithError(DoQCodeNoError, "")
+		conn.CloseWithError(QUICCodeNoError, "")
 	}()
 
 	for {
@@ -1962,7 +1988,7 @@ func (sm *SecureDNSManager) handleQUICConnection(conn *quic.Conn) {
 		sm.wg.Add(1)
 		go func() {
 			defer sm.wg.Done()
-			defer recoverPanic("DoQ流处理")
+			defer recoverPanic("QUIC流处理")
 			defer stream.Close()
 			sm.handleQUICStream(stream, conn)
 		}()
@@ -1972,58 +1998,58 @@ func (sm *SecureDNSManager) handleQUICConnection(conn *quic.Conn) {
 // handleQUICStream 处理 QUIC 流
 func (sm *SecureDNSManager) handleQUICStream(stream *quic.Stream, conn *quic.Conn) {
 	// 读取DNS消息
-	buf := make([]byte, UDPUpstreamBufferSize)
+	buf := make([]byte, SecureConnBufferSize)
 	n, err := sm.readAll(stream, buf)
 
 	if err != nil && err != io.EOF {
-		logf(LogDebug, "DoQ流读取失败: %v", err)
+		logf(LogDebug, "QUIC流读取失败: %v", err)
 		return
 	}
 
-	if n < minDNSPacketSize {
-		logf(LogDebug, "DoQ消息太短: %d字节", n)
+	if n < MinDNSPacketSize {
+		logf(LogDebug, "QUIC消息太短: %d字节", n)
 		return
 	}
 
-	// 解析DNS消息 (DoQ v1 格式，带长度前缀)
+	// 解析DNS消息 (QUIC格式，带长度前缀)
 	req := new(dns.Msg)
 	var msgData []byte
 
 	// 检查是否有长度前缀
 	packetLen := binary.BigEndian.Uint16(buf[:2])
 	if packetLen == uint16(n-2) {
-		// 有长度前缀，使用 DoQ v1 格式
+		// 有长度前缀，使用标准格式
 		msgData = buf[2:n]
 	} else {
 		// 无长度前缀，不支持旧版本
-		logf(LogDebug, "DoQ不支持的消息格式")
-		conn.CloseWithError(DoQCodeProtocolError, "")
+		logf(LogDebug, "QUIC不支持的消息格式")
+		conn.CloseWithError(QUICCodeProtocolError, "")
 		return
 	}
 
 	if err := req.Unpack(msgData); err != nil {
-		logf(LogDebug, "DoQ消息解析失败: %v", err)
-		conn.CloseWithError(DoQCodeProtocolError, "")
+		logf(LogDebug, "QUIC消息解析失败: %v", err)
+		conn.CloseWithError(QUICCodeProtocolError, "")
 		return
 	}
 
 	// 验证DNS消息
 	if !sm.validQUICMsg(req) {
-		conn.CloseWithError(DoQCodeProtocolError, "")
+		conn.CloseWithError(QUICCodeProtocolError, "")
 		return
 	}
 
 	// 处理DNS查询
-	clientIP := sm.getSecureClientIP(conn, "DoQ")
+	clientIP := sm.getSecureClientIP(conn, "QUIC")
 	response := sm.server.ProcessDNSQuery(req, clientIP)
 
 	// 发送响应
 	if err := sm.respondQUIC(stream, response); err != nil {
-		logf(LogDebug, "DoQ响应发送失败: %v", err)
+		logf(LogDebug, "QUIC响应发送失败: %v", err)
 	}
 }
 
-// handleSecureDNSConnection 统一处理安全DNS连接（DoT）
+// handleSecureDNSConnection 统一处理安全DNS连接（TLS）
 func (sm *SecureDNSManager) handleSecureDNSConnection(conn net.Conn, protocol string) {
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
@@ -2031,7 +2057,7 @@ func (sm *SecureDNSManager) handleSecureDNSConnection(conn net.Conn, protocol st
 	}
 
 	// 设置读取超时
-	tlsConn.SetReadDeadline(time.Now().Add(QueryTimeout))
+	tlsConn.SetReadDeadline(time.Now().Add(SecureConnQueryTimeout))
 
 	for {
 		select {
@@ -2095,7 +2121,7 @@ func (sm *SecureDNSManager) handleSecureDNSConnection(conn net.Conn, protocol st
 		}
 
 		// 重置读取超时
-		tlsConn.SetReadDeadline(time.Now().Add(QueryTimeout))
+		tlsConn.SetReadDeadline(time.Now().Add(SecureConnQueryTimeout))
 	}
 }
 
@@ -2116,11 +2142,11 @@ func (sm *SecureDNSManager) getSecureClientIP(conn interface{}, protocol string)
 
 // validQUICMsg 验证 QUIC DNS 消息
 func (sm *SecureDNSManager) validQUICMsg(req *dns.Msg) bool {
-	// 检查 EDNS TCP keepalive 选项（DoQ 中不允许）
+	// 检查 EDNS TCP keepalive 选项（QUIC 中不允许）
 	if opt := req.IsEdns0(); opt != nil {
 		for _, option := range opt.Option {
 			if option.Option() == dns.EDNS0TCPKEEPALIVE {
-				logf(LogDebug, "DoQ客户端发送了不允许的TCP keepalive选项")
+				logf(LogDebug, "QUIC客户端发送了不允许的TCP keepalive选项")
 				return false
 			}
 		}
@@ -2140,7 +2166,7 @@ func (sm *SecureDNSManager) respondQUIC(stream *quic.Stream, response *dns.Msg) 
 		return fmt.Errorf("响应打包失败: %w", err)
 	}
 
-	// DoQ v1 格式：2字节长度前缀 + DNS消息
+	// QUIC格式：2字节长度前缀 + DNS消息
 	buf := make([]byte, 2+len(respBuf))
 	binary.BigEndian.PutUint16(buf[:2], uint16(len(respBuf)))
 	copy(buf[2:], respBuf)
@@ -2216,8 +2242,8 @@ func (sm *SecureDNSManager) Shutdown() error {
 	sm.cancel()
 
 	// 关闭监听器
-	if sm.dotListener != nil {
-		sm.dotListener.Close()
+	if sm.tlsListener != nil {
+		sm.tlsListener.Close()
 	}
 	if sm.quicListener != nil {
 		sm.quicListener.Close()
@@ -2318,12 +2344,12 @@ func (qe *QueryEngine) ReleaseMessage(msg *dns.Msg) {
 	}
 }
 
-// executeQuery 执行单个DNS查询（支持UDP/TCP/DoT/DoQ）
+// executeQuery 执行单个DNS查询（支持UDP/TCP/TLS/QUIC）
 func (qe *QueryEngine) executeQuery(ctx context.Context, msg *dns.Msg, server *UpstreamServer, useTCP bool, tracker *RequestTracker) (*dns.Msg, error) {
 	protocol := strings.ToLower(server.Protocol)
 
 	switch protocol {
-	case "dot", "doq":
+	case "tls", "quic":
 		// 安全DNS查询
 		client, err := qe.connPool.GetSecure(protocol, server.Address, server.ServerName, server.SkipTLSVerify)
 		if err != nil {
@@ -2383,7 +2409,7 @@ func (qe *QueryEngine) ExecuteQuery(ctx context.Context, msg *dns.Msg, server *U
 	protocol := strings.ToLower(server.Protocol)
 
 	// 对于安全协议，直接查询不需要TCP回退
-	if protocol == "dot" || protocol == "doq" {
+	if protocol == "tls" || protocol == "quic" {
 		result.Response, result.Error = qe.executeQuery(queryCtx, msg, server, false, tracker)
 		result.Duration = time.Since(start)
 		result.Protocol = strings.ToUpper(protocol)
@@ -2891,8 +2917,8 @@ func (shp *DNSHijackPrevention) CheckResponse(currentDomain, queryDomain string,
 type UpstreamServer struct {
 	Address       string `json:"address"`         // 服务器地址
 	Policy        string `json:"policy"`          // 信任策略 (all/trusted_only/untrusted_only)
-	Protocol      string `json:"protocol"`        // 协议类型: "udp", "tcp", "dot", "doq"
-	ServerName    string `json:"server_name"`     // DoT/DoQ 的 SNI 名称
+	Protocol      string `json:"protocol"`        // 协议类型: "udp", "tcp", "tls", "quic"
+	ServerName    string `json:"server_name"`     // TLS/QUIC 的 SNI 名称
 	SkipTLSVerify bool   `json:"skip_tls_verify"` // 是否跳过TLS证书验证
 }
 
@@ -2967,7 +2993,7 @@ type ServerConfig struct {
 
 		// TLS 配置
 		TLS struct {
-			Port     string `json:"port"`      // DoT/DoQ 端口，默认 853
+			Port     string `json:"port"`      // TLS/QUIC 端口，默认 853
 			CertFile string `json:"cert_file"` // 证书文件路径
 			KeyFile  string `json:"key_file"`  // 私钥文件路径
 		} `json:"tls"`
@@ -3072,12 +3098,12 @@ func ValidateConfig(config *ServerConfig) error {
 			return fmt.Errorf("上游服务器 %d 信任策略无效: %s", i, server.Policy)
 		}
 		// 验证协议
-		validProtocols := map[string]bool{"udp": true, "tcp": true, "dot": true, "doq": true}
+		validProtocols := map[string]bool{"udp": true, "tcp": true, "tls": true, "quic": true}
 		if server.Protocol != "" && !validProtocols[strings.ToLower(server.Protocol)] {
 			return fmt.Errorf("上游服务器 %d 协议无效: %s", i, server.Protocol)
 		}
-		// DoT/DoQ 需要 ServerName
-		if (strings.ToLower(server.Protocol) == "dot" || strings.ToLower(server.Protocol) == "doq") && server.ServerName == "" {
+		// TLS/QUIC 需要 ServerName
+		if (strings.ToLower(server.Protocol) == "tls" || strings.ToLower(server.Protocol) == "quic") && server.ServerName == "" {
 			return fmt.Errorf("上游服务器 %d 使用 %s 协议需要配置 server_name", i, server.Protocol)
 		}
 	}
@@ -3201,26 +3227,31 @@ func GenerateExampleConfig() string {
 	config.Server.Features.Prefetch = true
 	config.Server.Features.HijackProtection = true
 
-	// 示例上游服务器配置（包含DoT/DoQ）
+	// 示例上游服务器配置（使用统一协议名称）
 	config.Upstream = []UpstreamServer{
 		{
-			Address:  "8.8.8.8:53",
+			Address:  "223.5.5.5:53",
 			Policy:   "all",
+			Protocol: "tcp",
+		},
+		{
+			Address:  "223.6.6.6:53",
+			Policy:   "tcp",
 			Protocol: "udp",
 		},
 		{
-			Address:       "1.1.1.1:853",
+			Address:       "223.5.5.5:853",
 			Policy:        "trusted_only",
-			Protocol:      "dot",
-			ServerName:    "cloudflare-dns.com",
+			Protocol:      "tls",
+			ServerName:    "dns.alidns.com",
 			SkipTLSVerify: false,
 		},
 		{
-			Address:       "dns.google:853",
+			Address:       "223.6.6.6:853",
 			Policy:        "all",
-			Protocol:      "doq",
-			ServerName:    "dns.google",
-			SkipTLSVerify: false,
+			Protocol:      "quic",
+			ServerName:    "dns.alidns.com",
+			SkipTLSVerify: true,
 		},
 		{
 			Address: "buildin_recursive",
@@ -3954,7 +3985,6 @@ func NewDNSServer(config *ServerConfig) (*RecursiveDNSServer, error) {
 		}
 
 		server.secureDNSManager = secureDNSManager
-		logf(LogInfo, "🔐 TLS证书已配置，将启动DoT和DoQ服务")
 	}
 
 	// 初始化缓存系统
@@ -4071,7 +4101,7 @@ func (r *RecursiveDNSServer) Start() error {
 			Handler: dns.HandlerFunc(r.handleDNSRequest),
 			UDPSize: UDPClientBufferSize,
 		}
-		logf(LogInfo, "📡 UDP服务器启动中...")
+		logf(LogInfo, "📡 UDP服务器启动: [::]:"+r.config.Server.Port)
 		if err := server.ListenAndServe(); err != nil {
 			errChan <- fmt.Errorf("UDP启动失败: %w", err)
 		}
@@ -4087,7 +4117,7 @@ func (r *RecursiveDNSServer) Start() error {
 			Net:     "tcp",
 			Handler: dns.HandlerFunc(r.handleDNSRequest),
 		}
-		logf(LogInfo, "🔌 TCP服务器启动中...")
+		logf(LogInfo, "🔌 TCP服务器启动: [::]:"+r.config.Server.Port)
 		if err := server.ListenAndServe(); err != nil {
 			errChan <- fmt.Errorf("TCP启动失败: %w", err)
 		}
@@ -4099,7 +4129,6 @@ func (r *RecursiveDNSServer) Start() error {
 			defer wg.Done()
 			defer recoverPanic("安全DNS服务器")
 
-			logf(LogInfo, "🔐 安全DNS服务器启动中...")
 			if err := r.secureDNSManager.Start(); err != nil {
 				errChan <- fmt.Errorf("安全DNS启动失败: %w", err)
 			}
@@ -4140,7 +4169,7 @@ func (r *RecursiveDNSServer) displayInfo() {
 					protocol = "UDP"
 				}
 				serverInfo := fmt.Sprintf("%s (%s) - %s", server.Address, protocol, server.Policy)
-				if server.SkipTLSVerify && (protocol == "DOT" || protocol == "DOQ") {
+				if server.SkipTLSVerify && (protocol == "TLS" || protocol == "QUIC") {
 					serverInfo += " [跳过TLS验证]"
 				}
 				logf(LogInfo, "🔗 上游服务器: %s", serverInfo)
@@ -4158,9 +4187,8 @@ func (r *RecursiveDNSServer) displayInfo() {
 
 	// 显示TLS相关信息
 	if r.secureDNSManager != nil {
-		logf(LogInfo, "🔐 TLS加密端口: %s", r.config.Server.TLS.Port)
-		logf(LogInfo, "🔐 证书文件: %s", r.config.Server.TLS.CertFile)
-		logf(LogInfo, "🔐 DoT/DoQ: 已启用")
+		logf(LogInfo, "🔐 监听加密端口: %s", r.config.Server.TLS.Port)
+		logf(LogInfo, "🔐 证书文件: %s %s", r.config.Server.TLS.CertFile, r.config.Server.TLS.KeyFile)
 	}
 
 	// 显示功能信息
