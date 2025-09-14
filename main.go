@@ -60,6 +60,7 @@ const (
 	SecureConnQueryTimeout     = 5 * time.Second  // 安全连接查询超时时间
 	SecureConnBufferSize       = 4096             // 安全连接缓冲区大小
 	MinDNSPacketSize           = 12               // DNS数据包最小长度
+	SecureConnMaxRetries       = 2                // 安全连接最大重试次数
 )
 
 // QUIC协议特定常量
@@ -1376,15 +1377,31 @@ func (h *SecureConnErrorHandler) isQUICRetryableError(err error) bool {
 	return false
 }
 
-// isTLSRetryableError 判断是否为可重试的TLS错误
+// isTLSRetryableError 判断是否为可重试的TLS错误（扩展版）
 func (h *SecureConnErrorHandler) isTLSRetryableError(err error) bool {
-	// 超时错误
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
+	if err == nil {
+		return false
 	}
 
-	// 连接被重置
-	if strings.Contains(err.Error(), "connection reset") {
+	errStr := err.Error()
+	// 检查各种连接错误
+	connectionErrors := []string{
+		"broken pipe",
+		"connection reset",
+		"use of closed network connection",
+		"connection refused",
+		"no route to host",
+		"network is unreachable",
+	}
+
+	for _, connErr := range connectionErrors {
+		if strings.Contains(errStr, connErr) {
+			return true
+		}
+	}
+
+	// 超时错误
+	if errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
 
@@ -1422,16 +1439,18 @@ type UnifiedSecureClient struct {
 	isQUICConnected bool
 
 	// 通用配置
-	mu sync.Mutex // 连接保护锁
+	mu           sync.Mutex // 连接保护锁
+	lastActivity time.Time  // 最后活动时间
 }
 
 // NewUnifiedSecureClient 创建统一的安全连接客户端
 func NewUnifiedSecureClient(protocol, addr, serverName string, skipVerify bool) (*UnifiedSecureClient, error) {
 	client := &UnifiedSecureClient{
-		protocol:   strings.ToLower(protocol),
-		serverName: serverName,
-		skipVerify: skipVerify,
-		timeout:    SecureConnQueryTimeout,
+		protocol:     strings.ToLower(protocol),
+		serverName:   serverName,
+		skipVerify:   skipVerify,
+		timeout:      SecureConnQueryTimeout,
+		lastActivity: time.Now(),
 	}
 
 	// 建立连接
@@ -1463,19 +1482,32 @@ func (c *UnifiedSecureClient) connect(addr string) error {
 	}
 }
 
-// connectTLS 建立TLS连接
+// connectTLS 建立TLS连接（添加keep-alive）
 func (c *UnifiedSecureClient) connectTLS(host, port string) error {
 	tlsConfig := &tls.Config{
 		ServerName:         c.serverName,
 		InsecureSkipVerify: c.skipVerify,
 	}
 
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: SecureConnHandshakeTimeout}, "tcp", net.JoinHostPort(host, port), tlsConfig)
+	// 使用带keep-alive的dialer
+	dialer := &net.Dialer{
+		Timeout:   SecureConnHandshakeTimeout,
+		KeepAlive: SecureConnKeepAlive,
+	}
+
+	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, port), tlsConfig)
 	if err != nil {
 		return fmt.Errorf("TLS连接失败: %w", err)
 	}
 
+	// 设置TCP keep-alive
+	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(SecureConnKeepAlive)
+	}
+
 	c.tlsConn = conn
+	c.lastActivity = time.Now()
 	return nil
 }
 
@@ -1503,14 +1535,70 @@ func (c *UnifiedSecureClient) connectQUIC(addr string) error {
 
 	c.quicConn = conn
 	c.isQUICConnected = true
+	c.lastActivity = time.Now()
 	return nil
 }
 
-// Exchange 执行安全DNS查询
-func (c *UnifiedSecureClient) Exchange(msg *dns.Msg, addr string) (*dns.Msg, error) {
+// isConnectionAlive 检查连接是否仍然有效
+func (c *UnifiedSecureClient) isConnectionAlive() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	switch c.protocol {
 	case "tls":
-		return c.exchangeTLS(msg)
+		if c.tlsConn == nil {
+			return false
+		}
+		// 检查连接是否超时
+		if time.Since(c.lastActivity) > SecureConnIdleTimeout {
+			return false
+		}
+		return true
+	case "quic":
+		return c.quicConn != nil && c.isQUICConnected &&
+			time.Since(c.lastActivity) <= SecureConnIdleTimeout
+	}
+	return false
+}
+
+// reconnectIfNeeded 在需要时重新连接
+func (c *UnifiedSecureClient) reconnectIfNeeded(addr string) error {
+	if c.isConnectionAlive() {
+		return nil
+	}
+
+	logf(LogDebug, "检测到%s连接断开，重新建立连接", strings.ToUpper(c.protocol))
+
+	// 清理旧连接
+	c.closeConnection()
+
+	// 重新建立连接
+	return c.connect(addr)
+}
+
+// isTLSConnectionError 判断是否为TLS连接错误
+func (c *UnifiedSecureClient) isTLSConnectionError(err error) bool {
+	return globalSecureConnErrorHandler.isTLSRetryableError(err)
+}
+
+// Exchange 执行安全DNS查询（添加自动重连）
+func (c *UnifiedSecureClient) Exchange(msg *dns.Msg, addr string) (*dns.Msg, error) {
+	// 检查并重连（如果需要）
+	if err := c.reconnectIfNeeded(addr); err != nil {
+		return nil, fmt.Errorf("重连失败: %w", err)
+	}
+
+	switch c.protocol {
+	case "tls":
+		resp, err := c.exchangeTLS(msg)
+		// 如果是连接错误，尝试重连一次
+		if err != nil && c.isTLSConnectionError(err) {
+			logf(LogDebug, "TLS连接错误，尝试重连: %v", err)
+			if reconnErr := c.connect(addr); reconnErr == nil {
+				return c.exchangeTLS(msg)
+			}
+		}
+		return resp, err
 	case "quic":
 		return c.exchangeQUIC(msg)
 	default:
@@ -1526,6 +1614,11 @@ func (c *UnifiedSecureClient) exchangeTLS(msg *dns.Msg) (*dns.Msg, error) {
 	if c.tlsConn == nil {
 		return nil, errors.New("TLS连接未建立")
 	}
+
+	// 设置读写超时
+	deadline := time.Now().Add(c.timeout)
+	c.tlsConn.SetDeadline(deadline)
+	defer c.tlsConn.SetDeadline(time.Time{})
 
 	// 打包查询消息
 	msgData, err := msg.Pack()
@@ -1566,6 +1659,7 @@ func (c *UnifiedSecureClient) exchangeTLS(msg *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("响应解析失败: %w", err)
 	}
 
+	c.lastActivity = time.Now()
 	return response, nil
 }
 
@@ -1654,7 +1748,11 @@ func (c *UnifiedSecureClient) exchangeQUICDirect(msg *dns.Msg) (*dns.Msg, error)
 	}
 
 	// 读取响应
-	return c.readQUICMsg(stream)
+	resp, err := c.readQUICMsg(stream)
+	if err == nil {
+		c.lastActivity = time.Now()
+	}
+	return resp, err
 }
 
 // readQUICMsg 从QUIC流中读取DNS响应
@@ -1694,6 +1792,19 @@ func (c *UnifiedSecureClient) readQUICMsg(stream *quic.Stream) (*dns.Msg, error)
 	return response, nil
 }
 
+// closeConnection 关闭连接（安全版本）
+func (c *UnifiedSecureClient) closeConnection() {
+	switch c.protocol {
+	case "tls":
+		if c.tlsConn != nil {
+			c.tlsConn.Close()
+			c.tlsConn = nil
+		}
+	case "quic":
+		c.closeQUICConn()
+	}
+}
+
 // closeQUICConn 关闭QUIC连接
 func (c *UnifiedSecureClient) closeQUICConn() {
 	if c.quicConn != nil {
@@ -1708,16 +1819,7 @@ func (c *UnifiedSecureClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	switch c.protocol {
-	case "tls":
-		if c.tlsConn != nil {
-			err := c.tlsConn.Close()
-			c.tlsConn = nil
-			return err
-		}
-	case "quic":
-		c.closeQUICConn()
-	}
+	c.closeConnection()
 	return nil
 }
 
@@ -1769,16 +1871,29 @@ func (cpm *ConnectionPoolManager) GetTCPClient() *dns.Client {
 	}
 }
 
-// GetSecureClient 获取安全DNS客户端（TLS/QUIC）
+// GetSecureClient 获取安全DNS客户端（添加连接检查）
 func (cpm *ConnectionPoolManager) GetSecureClient(protocol, addr, serverName string, skipVerify bool) (SecureClient, error) {
 	cacheKey := fmt.Sprintf("%s:%s:%s:%v", protocol, addr, serverName, skipVerify)
 
 	cpm.mu.RLock()
 	if client, exists := cpm.secureClients[cacheKey]; exists {
 		cpm.mu.RUnlock()
-		return client, nil
+
+		// 检查连接是否仍然有效
+		if unifiedClient, ok := client.(*UnifiedSecureClient); ok {
+			if unifiedClient.isConnectionAlive() {
+				return client, nil
+			} else {
+				// 连接失效，从缓存中移除
+				cpm.mu.Lock()
+				delete(cpm.secureClients, cacheKey)
+				cpm.mu.Unlock()
+				client.Close()
+			}
+		}
+	} else {
+		cpm.mu.RUnlock()
 	}
-	cpm.mu.RUnlock()
 
 	// 创建新的安全客户端
 	client, err := NewUnifiedSecureClient(protocol, addr, serverName, skipVerify)
