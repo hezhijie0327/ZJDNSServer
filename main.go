@@ -3447,10 +3447,10 @@ func (cm *ConfigManager) GenerateExampleConfig() string {
 			SkipTLSVerify: false,
 		},
 		{
-			Address:       "https://dns.google/dns-query",
+			Address:       "https://dns.alidns.com/dns-query",
 			Policy:        "trusted_only",
 			Protocol:      "http3",
-			ServerName:    "dns.google",
+			ServerName:    "dns.alidns.com",
 			SkipTLSVerify: false,
 		},
 		{
