@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -28,7 +29,9 @@ import (
 	"github.com/bluele/gcache"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/net/http2"
 )
 
 // ==================== 系统常量定义 ====================
@@ -37,6 +40,7 @@ import (
 const (
 	DNSServerPort            = "53"
 	DNSServerSecurePort      = "853"
+	DNSServerHTTPSPort       = "443"
 	RecursiveServerIndicator = "buildin_recursive"
 	ClientUDPBufferSize      = 1232
 	UpstreamUDPBufferSize    = 4096
@@ -62,6 +66,13 @@ const (
 	SecureConnMaxRetries       = 2
 )
 
+// HTTPS/DoH 相关常量
+const (
+	DoHReadHeaderTimeout = 5 * time.Second
+	DoHWriteTimeout      = 5 * time.Second
+	DoHMaxRequestSize    = 8192
+)
+
 // QUIC协议相关常量
 const (
 	QUICAddrValidatorCacheSize = 1000
@@ -69,6 +80,7 @@ const (
 )
 
 var NextProtoQUIC = []string{"doq", "doq-i02", "doq-i00", "dq"}
+var NextProtoHTTP3 = []string{"h3"}
 
 const (
 	QUICCodeNoError       quic.ApplicationErrorCode = 0
@@ -1403,6 +1415,291 @@ func (cpm *ConnectionPoolManager) Close() error {
 	return nil
 }
 
+// ==================== DoH/DoH3 管理器 ====================
+
+type DoHManager struct {
+	server        *RecursiveDNSServer
+	tlsConfig     *tls.Config
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	httpsServer   *http.Server
+	h3Server      *http3.Server
+	httpsListener net.Listener
+	h3Listener    *quic.EarlyListener
+}
+
+func NewDoHManager(server *RecursiveDNSServer, config *ServerConfig) (*DoHManager, error) {
+	cert, err := tls.LoadX509KeyPair(config.Server.TLS.CertFile, config.Server.TLS.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("加载证书失败: %w", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &DoHManager{
+		server:    server,
+		tlsConfig: tlsConfig,
+		ctx:       ctx,
+		cancel:    cancel,
+	}, nil
+}
+
+func (dm *DoHManager) Start(httpsPort string) error {
+	var wg sync.WaitGroup
+	errChan := make(chan error, 2)
+
+	wg.Add(2)
+
+	// 启动 DoH (HTTP/2) 服务器
+	go func() {
+		defer wg.Done()
+		defer handlePanic("DoH服务器")
+
+		if err := dm.startDoHServer(httpsPort); err != nil {
+			errChan <- fmt.Errorf("DoH启动失败: %w", err)
+		}
+	}()
+
+	// 启动 DoH3 (HTTP/3) 服务器
+	go func() {
+		defer wg.Done()
+		defer handlePanic("DoH3服务器")
+
+		if err := dm.startDoH3Server(httpsPort); err != nil {
+			errChan <- fmt.Errorf("DoH3启动失败: %w", err)
+		}
+	}()
+
+	// 等待启动完成或错误
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (dm *DoHManager) startDoHServer(port string) error {
+	listener, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		return fmt.Errorf("DoH监听失败: %w", err)
+	}
+
+	// 配置 TLS 以支持 HTTP/2
+	tlsConfig := dm.tlsConfig.Clone()
+	tlsConfig.NextProtos = []string{http2.NextProtoTLS, "http/1.1"}
+
+	dm.httpsListener = tls.NewListener(listener, tlsConfig)
+	writeLog(LogInfo, "🌐 DoH服务器启动: %s", dm.httpsListener.Addr())
+
+	dm.httpsServer = &http.Server{
+		Handler:           dm,
+		ReadHeaderTimeout: DoHReadHeaderTimeout,
+		WriteTimeout:      DoHWriteTimeout,
+	}
+
+	dm.wg.Add(1)
+	go func() {
+		defer dm.wg.Done()
+		defer handlePanic("DoH服务器")
+
+		if err := dm.httpsServer.Serve(dm.httpsListener); err != nil && err != http.ErrServerClosed {
+			writeLog(LogError, "DoH服务器错误: %v", err)
+		}
+	}()
+
+	return nil
+}
+
+func (dm *DoHManager) startDoH3Server(port string) error {
+	addr := ":" + port
+
+	// 创建 QUIC TLS 配置
+	tlsConfig := dm.tlsConfig.Clone()
+	tlsConfig.NextProtos = NextProtoHTTP3
+
+	// 创建 QUIC 配置
+	quicConfig := &quic.Config{
+		MaxIdleTimeout:        SecureConnIdleTimeout,
+		MaxIncomingStreams:    math.MaxUint16,
+		MaxIncomingUniStreams: math.MaxUint16,
+		Allow0RTT:             true,
+	}
+
+	quicListener, err := quic.ListenAddrEarly(addr, tlsConfig, quicConfig)
+	if err != nil {
+		return fmt.Errorf("DoH3监听失败: %w", err)
+	}
+
+	dm.h3Listener = quicListener
+	writeLog(LogInfo, "🚀 DoH3服务器启动: %s", dm.h3Listener.Addr())
+
+	dm.h3Server = &http3.Server{
+		Handler: dm,
+	}
+
+	dm.wg.Add(1)
+	go func() {
+		defer dm.wg.Done()
+		defer handlePanic("DoH3服务器")
+
+		if err := dm.h3Server.ServeListener(dm.h3Listener); err != nil && err != http.ErrServerClosed {
+			writeLog(LogError, "DoH3服务器错误: %v", err)
+		}
+	}()
+
+	return nil
+}
+
+// ServeHTTP 实现 http.Handler 接口，处理 DoH 查询
+func (dm *DoHManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if logConfig.level >= LogDebug {
+		writeLog(LogDebug, "🌐 收到DoH请求: %s %s", r.Method, r.URL.Path)
+	}
+
+	req, statusCode := dm.parseDoHRequest(r)
+	if req == nil {
+		http.Error(w, http.StatusText(statusCode), statusCode)
+		return
+	}
+
+	// 处理 DNS 查询
+	response := dm.server.ProcessDNSQuery(req, nil, true)
+
+	// 发送响应
+	if err := dm.respondDoH(w, response); err != nil {
+		writeLog(LogError, "DoH响应发送失败: %v", err)
+	}
+}
+
+func (dm *DoHManager) parseDoHRequest(r *http.Request) (*dns.Msg, int) {
+	var buf []byte
+	var err error
+
+	switch r.Method {
+	case http.MethodGet:
+		dnsParam := r.URL.Query().Get("dns")
+		if dnsParam == "" {
+			writeLog(LogDebug, "DoH GET请求缺少dns参数")
+			return nil, http.StatusBadRequest
+		}
+
+		buf, err = base64.RawURLEncoding.DecodeString(dnsParam)
+		if err != nil {
+			writeLog(LogDebug, "DoH GET请求dns参数解码失败: %v", err)
+			return nil, http.StatusBadRequest
+		}
+
+	case http.MethodPost:
+		contentType := r.Header.Get("Content-Type")
+		if contentType != "application/dns-message" {
+			writeLog(LogDebug, "DoH POST请求Content-Type不支持: %s", contentType)
+			return nil, http.StatusUnsupportedMediaType
+		}
+
+		// 限制请求大小
+		r.Body = http.MaxBytesReader(nil, r.Body, DoHMaxRequestSize)
+		buf, err = io.ReadAll(r.Body)
+		if err != nil {
+			writeLog(LogDebug, "DoH POST请求体读取失败: %v", err)
+			return nil, http.StatusBadRequest
+		}
+		defer r.Body.Close()
+
+	default:
+		writeLog(LogDebug, "DoH请求方法不支持: %s", r.Method)
+		return nil, http.StatusMethodNotAllowed
+	}
+
+	if len(buf) == 0 {
+		writeLog(LogDebug, "DoH请求数据为空")
+		return nil, http.StatusBadRequest
+	}
+
+	req := new(dns.Msg)
+	if err := req.Unpack(buf); err != nil {
+		writeLog(LogDebug, "DoH DNS消息解析失败: %v", err)
+		return nil, http.StatusBadRequest
+	}
+
+	return req, http.StatusOK
+}
+
+func (dm *DoHManager) respondDoH(w http.ResponseWriter, response *dns.Msg) error {
+	if response == nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return nil
+	}
+
+	bytes, err := response.Pack()
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return fmt.Errorf("响应打包失败: %w", err)
+	}
+
+	w.Header().Set("Content-Type", "application/dns-message")
+	w.Header().Set("Cache-Control", "max-age=0")
+
+	_, err = w.Write(bytes)
+	return err
+}
+
+func (dm *DoHManager) Shutdown() error {
+	writeLog(LogInfo, "🛑 正在关闭DoH/DoH3服务器...")
+
+	dm.cancel()
+
+	// 关闭 HTTP 服务器
+	if dm.httpsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		dm.httpsServer.Shutdown(ctx)
+	}
+
+	// 关闭 HTTP/3 服务器
+	if dm.h3Server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		dm.h3Server.Shutdown(ctx)
+	}
+
+	// 关闭监听器
+	if dm.httpsListener != nil {
+		dm.httpsListener.Close()
+	}
+	if dm.h3Listener != nil {
+		dm.h3Listener.Close()
+	}
+
+	// 等待所有 goroutine 完成
+	done := make(chan struct{})
+	go func() {
+		dm.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		writeLog(LogInfo, "✅ DoH/DoH3服务器已安全关闭")
+		return nil
+	case <-time.After(GracefulShutdownTimeout):
+		writeLog(LogWarn, "⏰ DoH/DoH3服务器关闭超时")
+		return fmt.Errorf("DoH/DoH3服务器关闭超时")
+	}
+}
+
 // ==================== 统一安全DNS服务器管理器 ====================
 
 type SecureDNSManager struct {
@@ -2506,9 +2803,10 @@ type ServerConfig struct {
 		TrustedCIDRFile string `json:"trusted_cidr_file"`
 
 		TLS struct {
-			Port     string `json:"port"`
-			CertFile string `json:"cert_file"`
-			KeyFile  string `json:"key_file"`
+			Port      string `json:"port"`
+			HTTPSPort string `json:"https_port"`
+			CertFile  string `json:"cert_file"`
+			KeyFile   string `json:"key_file"`
 		} `json:"tls"`
 
 		Features struct {
@@ -2702,6 +3000,7 @@ func (cm *ConfigManager) getDefaultConfig() *ServerConfig {
 	config.Server.TrustedCIDRFile = ""
 
 	config.Server.TLS.Port = DNSServerSecurePort
+	config.Server.TLS.HTTPSPort = ""
 	config.Server.TLS.CertFile = ""
 	config.Server.TLS.KeyFile = ""
 
@@ -2746,6 +3045,7 @@ func (cm *ConfigManager) GenerateExampleConfig() string {
 
 	config.Server.TLS.CertFile = "/path/to/cert.pem"
 	config.Server.TLS.KeyFile = "/path/to/key.pem"
+	config.Server.TLS.HTTPSPort = DNSServerHTTPSPort
 
 	config.Redis.Address = "127.0.0.1:6379"
 	config.Server.Features.ServeStale = true
@@ -3306,6 +3606,7 @@ type RecursiveDNSServer struct {
 	ednsManager      *EDNSManager
 	queryEngine      *QueryEngine
 	secureDNSManager *SecureDNSManager
+	dohManager       *DoHManager
 	closed           int32
 }
 
@@ -3389,6 +3690,7 @@ func NewDNSServer(config *ServerConfig) (*RecursiveDNSServer, error) {
 		queryEngine:      queryEngine,
 	}
 
+	// 初始化安全DNS管理器（DoT/DoQ）
 	if config.Server.TLS.CertFile != "" && config.Server.TLS.KeyFile != "" {
 		secureDNSManager, err := NewSecureDNSManager(server, config)
 		if err != nil {
@@ -3396,6 +3698,16 @@ func NewDNSServer(config *ServerConfig) (*RecursiveDNSServer, error) {
 			return nil, fmt.Errorf("安全DNS管理器初始化失败: %w", err)
 		}
 		server.secureDNSManager = secureDNSManager
+
+		// 初始化DoH/DoH3管理器
+		if config.Server.TLS.HTTPSPort != "" {
+			dohManager, err := NewDoHManager(server, config)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("DoH管理器初始化失败: %w", err)
+			}
+			server.dohManager = dohManager
+		}
 	}
 
 	var cache DNSCache
@@ -3446,6 +3758,10 @@ func (r *RecursiveDNSServer) shutdownServer() {
 		r.secureDNSManager.Shutdown()
 	}
 
+	if r.dohManager != nil {
+		r.dohManager.Shutdown()
+	}
+
 	r.connPool.Close()
 	r.taskManager.Shutdown(GracefulShutdownTimeout)
 
@@ -3486,6 +3802,10 @@ func (r *RecursiveDNSServer) Start() error {
 	serverCount := 2
 
 	if r.secureDNSManager != nil {
+		serverCount += 1
+	}
+
+	if r.dohManager != nil {
 		serverCount += 1
 	}
 
@@ -3543,6 +3863,22 @@ func (r *RecursiveDNSServer) Start() error {
 		}()
 	}
 
+	// 启动DoH/DoH3服务器（如果已配置）
+	if r.dohManager != nil {
+		go func() {
+			defer wg.Done()
+			defer handlePanic("DoH服务器")
+
+			httpsPort := r.config.Server.TLS.HTTPSPort
+			if httpsPort == "" {
+				httpsPort = DNSServerHTTPSPort
+			}
+			if err := r.dohManager.Start(httpsPort); err != nil {
+				errChan <- fmt.Errorf("DoH启动失败: %w", err)
+			}
+		}()
+	}
+
 	// 等待错误或正常结束
 	go func() {
 		wg.Wait()
@@ -3588,6 +3924,14 @@ func (r *RecursiveDNSServer) displayInfo() {
 
 	if r.secureDNSManager != nil {
 		writeLog(LogInfo, "🔐 监听加密端口: %s", r.config.Server.TLS.Port)
+	}
+
+	if r.dohManager != nil {
+		httpsPort := r.config.Server.TLS.HTTPSPort
+		if httpsPort == "" {
+			httpsPort = DNSServerHTTPSPort
+		}
+		writeLog(LogInfo, "🌐 监听DoH/DoH3端口: %s", httpsPort)
 	}
 
 	if r.ipFilter.HasData() {
