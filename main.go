@@ -43,6 +43,7 @@ const (
 	DNSServerPort            = "53"
 	DNSServerSecurePort      = "853"
 	DNSServerHTTPSPort       = "443"
+	DNSServerHTTPSEndpoint   = "dns-query"
 	RecursiveServerIndicator = "buildin_recursive"
 	ClientUDPBufferSize      = 1232
 	UpstreamUDPBufferSize    = 4096
@@ -1998,6 +1999,13 @@ func (dm *DoHManager) startDoH3Server(port string) error {
 
 // ServeHTTP 实现 http.Handler 接口，处理 DoH 查询
 func (dm *DoHManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 检查请求路径
+	expectedPath := "/" + dm.server.config.Server.TLS.HTTPS.Endpoint
+	if r.URL.Path != expectedPath {
+		http.NotFound(w, r)
+		return
+	}
+
 	if logConfig.level >= LogDebug {
 		writeLog(LogDebug, "🌐 收到DoH请求: %s %s", r.Method, r.URL.Path)
 	}
@@ -3236,10 +3244,14 @@ type ServerConfig struct {
 		TrustedCIDRFile string `json:"trusted_cidr_file"`
 
 		TLS struct {
-			Port      string `json:"port"`
-			HTTPSPort string `json:"https_port"`
-			CertFile  string `json:"cert_file"`
-			KeyFile   string `json:"key_file"`
+			Port     string `json:"port"`
+			CertFile string `json:"cert_file"`
+			KeyFile  string `json:"key_file"`
+
+			HTTPS struct {
+				Port     string `json:"port"`
+				Endpoint string `json:"endpoint"`
+			} `json:"https"`
 		} `json:"tls"`
 
 		Features struct {
@@ -3441,7 +3453,8 @@ func (cm *ConfigManager) getDefaultConfig() *ServerConfig {
 	config.Server.TrustedCIDRFile = ""
 
 	config.Server.TLS.Port = DNSServerSecurePort
-	config.Server.TLS.HTTPSPort = ""
+	config.Server.TLS.HTTPS.Port = DNSServerHTTPSEndpoint
+	config.Server.TLS.HTTPS.Endpoint = DNSServerHTTPSEndpoint
 	config.Server.TLS.CertFile = ""
 	config.Server.TLS.KeyFile = ""
 
@@ -3486,7 +3499,8 @@ func (cm *ConfigManager) GenerateExampleConfig() string {
 
 	config.Server.TLS.CertFile = "/path/to/cert.pem"
 	config.Server.TLS.KeyFile = "/path/to/key.pem"
-	config.Server.TLS.HTTPSPort = DNSServerHTTPSPort
+	config.Server.TLS.HTTPS.Port = DNSServerHTTPSPort
+	config.Server.TLS.HTTPS.Endpoint = DNSServerHTTPSEndpoint
 
 	config.Redis.Address = "127.0.0.1:6379"
 	config.Server.Features.ServeStale = true
@@ -4155,7 +4169,7 @@ func NewDNSServer(config *ServerConfig) (*RecursiveDNSServer, error) {
 		server.secureDNSManager = secureDNSManager
 
 		// 初始化DoH/DoH3管理器
-		if config.Server.TLS.HTTPSPort != "" {
+		if config.Server.TLS.HTTPS.Port != "" {
 			dohManager, err := NewDoHManager(server, config)
 			if err != nil {
 				cancel()
@@ -4324,7 +4338,7 @@ func (r *RecursiveDNSServer) Start() error {
 			defer wg.Done()
 			defer handlePanic("DoH服务器")
 
-			httpsPort := r.config.Server.TLS.HTTPSPort
+			httpsPort := r.config.Server.TLS.HTTPS.Port
 			if httpsPort == "" {
 				httpsPort = DNSServerHTTPSPort
 			}
@@ -4382,11 +4396,12 @@ func (r *RecursiveDNSServer) displayInfo() {
 	}
 
 	if r.dohManager != nil {
-		httpsPort := r.config.Server.TLS.HTTPSPort
+		httpsPort := r.config.Server.TLS.HTTPS.Port
 		if httpsPort == "" {
 			httpsPort = DNSServerHTTPSPort
 		}
-		writeLog(LogInfo, "🌐 监听DoH/DoH3端口: %s", httpsPort)
+		endpoint := r.config.Server.TLS.HTTPS.Endpoint
+		writeLog(LogInfo, "🌐 监听DoH/DoH3端口: %s (endpoint: /%s)", httpsPort, endpoint)
 	}
 
 	if r.ipFilter.HasData() {
