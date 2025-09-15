@@ -205,9 +205,9 @@ func (l LogLevel) String() string {
 		color string
 	}{
 		{"NONE", "🔇", ColorGray},
-		{"ERROR", "🔥", ColorRed},
+		{"ERROR", "❌", ColorRed},
 		{"WARN", "⚠️", ColorYellow},
-		{"INFO", "📋", ColorGreen},
+		{"INFO", "✅", ColorGreen},
 		{"DEBUG", "🔍", ColorBlue},
 	}
 
@@ -231,7 +231,7 @@ func (l LogLevel) String() string {
 
 func writeLog(level LogLevel, format string, args ...interface{}) {
 	if level <= logConfig.level {
-		timestamp := time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
+		timestamp := time.Now().Format("2006-01-02 15:04:05")
 		message := fmt.Sprintf(format, args...)
 		logLine := fmt.Sprintf("%s[%s] %s %s", ColorGray, timestamp, level.String(), message)
 		if logConfig.useColor {
@@ -428,7 +428,7 @@ func NewEDNSManager(defaultSubnet string, paddingEnabled bool) (*EDNSManager, er
 	}
 
 	if paddingEnabled {
-		writeLog(LogInfo, "🔒 DNS Padding: 已启用 (RFC 7830, 块大小: %d字节, 仅对安全连接生效)", DNSPaddingBlockSize)
+		writeLog(LogInfo, "📦 DNS Padding: 已启用 (块大小: %d字节, 仅对安全DNS协议生效)", DNSPaddingBlockSize)
 	}
 
 	return manager, nil
@@ -546,7 +546,7 @@ func (em *EDNSManager) AddToMessage(msg *dns.Msg, ecs *ECSOption, dnssecEnabled 
 
 		if paddingOption := em.createPaddingOption(paddingSize); paddingOption != nil {
 			options = append(options, paddingOption)
-			writeLog(LogDebug, "🔒 DNS Padding: 消息从 %d 字节填充到 %d 字节 (+%d)",
+			writeLog(LogDebug, "📦 DNS Padding: 消息从 %d 字节填充到 %d 字节 (+%d)",
 				currentSize, currentSize+paddingSize, paddingSize)
 		}
 	}
@@ -1879,7 +1879,7 @@ func NewSecureDNSManager(server *RecursiveDNSServer, config *ServerConfig) (*Sec
 
 func (sm *SecureDNSManager) Start(httpsPort string) error {
 	var wg sync.WaitGroup
-	serverCount := 2 // TLS + QUIC
+	serverCount := 2 // DoT + DoQ
 
 	// 如果配置了HTTPS端口，增加DoH/DoH3服务器
 	if httpsPort != "" {
@@ -1889,23 +1889,23 @@ func (sm *SecureDNSManager) Start(httpsPort string) error {
 	errChan := make(chan error, serverCount)
 	wg.Add(serverCount)
 
-	// 启动 TLS 服务器
+	// 启动 DoT 服务器
 	go func() {
 		defer wg.Done()
-		defer handlePanic("TLS服务器")
+		defer handlePanic("DoT服务器")
 
 		if err := sm.startTLSServer(); err != nil {
-			errChan <- fmt.Errorf("TLS启动失败: %w", err)
+			errChan <- fmt.Errorf("DoT启动失败: %w", err)
 		}
 	}()
 
-	// 启动 QUIC 服务器
+	// 启动 DoQ 服务器
 	go func() {
 		defer wg.Done()
-		defer handlePanic("QUIC服务器")
+		defer handlePanic("DoQ服务器")
 
 		if err := sm.startQUICServer(); err != nil {
-			errChan <- fmt.Errorf("QUIC启动失败: %w", err)
+			errChan <- fmt.Errorf("DoQ启动失败: %w", err)
 		}
 	}()
 
@@ -1950,16 +1950,16 @@ func (sm *SecureDNSManager) Start(httpsPort string) error {
 func (sm *SecureDNSManager) startTLSServer() error {
 	listener, err := net.Listen("tcp", ":"+sm.server.config.Server.TLS.Port)
 	if err != nil {
-		return fmt.Errorf("TLS监听失败: %w", err)
+		return fmt.Errorf("DoT监听失败: %w", err)
 	}
 
 	sm.tlsListener = tls.NewListener(listener, sm.tlsConfig)
-	writeLog(LogInfo, "🔐 TLS服务器启动: %s", sm.tlsListener.Addr())
+	writeLog(LogInfo, "🔐 DoT服务器启动: %s", sm.tlsListener.Addr())
 
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
-		defer handlePanic("TLS服务器")
+		defer handlePanic("DoT服务器")
 		sm.handleTLSConnections()
 	}()
 
@@ -2001,15 +2001,15 @@ func (sm *SecureDNSManager) startQUICServer() error {
 	sm.quicListener, err = sm.quicTransport.ListenEarly(quicTLSConfig, quicConfig)
 	if err != nil {
 		sm.quicConn.Close()
-		return fmt.Errorf("QUIC监听失败: %w", err)
+		return fmt.Errorf("DoQ监听失败: %w", err)
 	}
 
-	writeLog(LogInfo, "🚀 QUIC服务器启动: %s", sm.quicListener.Addr())
+	writeLog(LogInfo, "🚀 DoQ服务器启动: %s", sm.quicListener.Addr())
 
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
-		defer handlePanic("QUIC服务器")
+		defer handlePanic("DoQ服务器")
 		sm.handleQUICConnections()
 	}()
 
@@ -2071,7 +2071,7 @@ func (sm *SecureDNSManager) startDoH3Server(port string) error {
 	}
 
 	sm.h3Listener = quicListener
-	writeLog(LogInfo, "🚀 DoH3服务器启动: %s", sm.h3Listener.Addr())
+	writeLog(LogInfo, "⚡ DoH3服务器启动: %s", sm.h3Listener.Addr())
 
 	sm.h3Server = &http3.Server{
 		Handler: sm,
@@ -2224,16 +2224,16 @@ func (sm *SecureDNSManager) handleTLSConnections() {
 			if sm.ctx.Err() != nil {
 				return
 			}
-			writeLog(LogError, "TLS连接接受失败: %v", err)
+			writeLog(LogError, "DoT连接接受失败: %v", err)
 			continue
 		}
 
 		sm.wg.Add(1)
 		go func() {
 			defer sm.wg.Done()
-			defer handlePanic("TLS连接处理")
+			defer handlePanic("DoT连接处理")
 			defer conn.Close()
-			sm.handleSecureDNSConnection(conn, "TLS")
+			sm.handleSecureDNSConnection(conn, "DoT")
 		}()
 	}
 }
@@ -2258,7 +2258,7 @@ func (sm *SecureDNSManager) handleQUICConnections() {
 		sm.wg.Add(1)
 		go func() {
 			defer sm.wg.Done()
-			defer handlePanic("QUIC连接处理")
+			defer handlePanic("DoQ连接处理")
 			sm.handleQUICConnection(conn)
 		}()
 	}
@@ -2285,7 +2285,7 @@ func (sm *SecureDNSManager) handleQUICConnection(conn *quic.Conn) {
 		sm.wg.Add(1)
 		go func() {
 			defer sm.wg.Done()
-			defer handlePanic("QUIC流处理")
+			defer handlePanic("DoQ流处理")
 			defer stream.Close()
 			sm.handleQUICStream(stream, conn)
 		}()
@@ -2298,12 +2298,12 @@ func (sm *SecureDNSManager) handleQUICStream(stream *quic.Stream, conn *quic.Con
 	n, err := sm.readAll(stream, buf)
 
 	if err != nil && err != io.EOF {
-		writeLog(LogDebug, "QUIC流读取失败: %v", err)
+		writeLog(LogDebug, "DoQ流读取失败: %v", err)
 		return
 	}
 
 	if n < MinDNSPacketSize {
-		writeLog(LogDebug, "QUIC消息太短: %d字节", n)
+		writeLog(LogDebug, "DoQ消息太短: %d字节", n)
 		return
 	}
 
@@ -2318,13 +2318,13 @@ func (sm *SecureDNSManager) handleQUICStream(stream *quic.Stream, conn *quic.Con
 		msgData = buf[2:n]
 	} else {
 		// 无长度前缀，不支持旧版本
-		writeLog(LogDebug, "QUIC不支持的消息格式")
+		writeLog(LogDebug, "DoQ不支持的消息格式")
 		conn.CloseWithError(QUICCodeProtocolError, "")
 		return
 	}
 
 	if err := req.Unpack(msgData); err != nil {
-		writeLog(LogDebug, "QUIC消息解析失败: %v", err)
+		writeLog(LogDebug, "DoQ消息解析失败: %v", err)
 		conn.CloseWithError(QUICCodeProtocolError, "")
 		return
 	}
@@ -2336,12 +2336,12 @@ func (sm *SecureDNSManager) handleQUICStream(stream *quic.Stream, conn *quic.Con
 	}
 
 	// 处理DNS查询
-	clientIP := sm.getSecureClientIP(conn, "QUIC")
+	clientIP := sm.getSecureClientIP(conn, "DoQ")
 	response := sm.server.ProcessDNSQuery(req, clientIP, true)
 
 	// 发送响应
 	if err := sm.respondQUIC(stream, response); err != nil {
-		writeLog(LogDebug, "QUIC响应发送失败: %v", err)
+		writeLog(LogDebug, "DoQ响应发送失败: %v", err)
 	}
 }
 
@@ -2428,7 +2428,7 @@ func (sm *SecureDNSManager) validQUICMsg(req *dns.Msg) bool {
 	if opt := req.IsEdns0(); opt != nil {
 		for _, option := range opt.Option {
 			if option.Option() == dns.EDNS0TCPKEEPALIVE {
-				writeLog(LogDebug, "QUIC客户端发送了不允许的TCP keepalive选项")
+				writeLog(LogDebug, "DoQ客户端发送了不允许的TCP keepalive选项")
 				return false
 			}
 		}
@@ -2469,9 +2469,9 @@ func (sm *SecureDNSManager) respondQUIC(stream *quic.Stream, response *dns.Msg) 
 // logQUICError 记录 QUIC 错误
 func (sm *SecureDNSManager) logQUICError(prefix string, err error) {
 	if sm.isQUICErrorForDebugLog(err) {
-		writeLog(LogDebug, "QUIC连接关闭: %s - %v", prefix, err)
+		writeLog(LogDebug, "DoQ连接关闭: %s - %v", prefix, err)
 	} else {
-		writeLog(LogError, "QUIC错误: %s - %v", prefix, err)
+		writeLog(LogError, "DoQ错误: %s - %v", prefix, err)
 	}
 }
 
@@ -2626,6 +2626,12 @@ func (qe *QueryEngine) ReleaseMessage(msg *dns.Msg) {
 func (qe *QueryEngine) executeQuery(ctx context.Context, msg *dns.Msg, server *UpstreamServer, useTCP bool, tracker *RequestTracker) (*dns.Msg, error) {
 	protocol := strings.ToLower(server.Protocol)
 
+	// 协议emoji映射
+	protocolEmoji := map[string]string{
+		"tls": "🔐", "quic": "🚀", "https": "🌐", "http3": "⚡",
+		"tcp": "🔌", "udp": "📡",
+	}
+
 	switch protocol {
 	case "tls", "quic", "https", "http3":
 		client, err := qe.connPool.GetSecureClient(protocol, server.Address, server.ServerName, server.SkipTLSVerify)
@@ -2639,7 +2645,8 @@ func (qe *QueryEngine) executeQuery(ctx context.Context, msg *dns.Msg, server *U
 		}
 
 		if tracker != nil {
-			tracker.AddStep("%s查询成功，响应码: %s", strings.ToUpper(protocol), dns.RcodeToString[response.Rcode])
+			emoji := protocolEmoji[protocol]
+			tracker.AddStep("%s %s查询成功，响应码: %s", emoji, strings.ToUpper(protocol), dns.RcodeToString[response.Rcode])
 		}
 
 		return response, nil
@@ -2657,10 +2664,12 @@ func (qe *QueryEngine) executeQuery(ctx context.Context, msg *dns.Msg, server *U
 
 		if tracker != nil && err == nil {
 			protocolName := "UDP"
+			emoji := "📡"
 			if useTCP || protocol == "tcp" {
 				protocolName = "TCP"
+				emoji = "🔌"
 			}
-			tracker.AddStep("%s查询成功，响应码: %s", protocolName, dns.RcodeToString[response.Rcode])
+			tracker.AddStep("%s %s查询成功，响应码: %s", emoji, protocolName, dns.RcodeToString[response.Rcode])
 		}
 
 		return response, err
@@ -2700,12 +2709,12 @@ func (qe *QueryEngine) ExecuteQuery(ctx context.Context, msg *dns.Msg, server *U
 	if result.Error != nil {
 		needTCPFallback = true
 		if tracker != nil {
-			tracker.AddStep("UDP查询失败，准备TCP回退: %v", result.Error)
+			tracker.AddStep("📡 UDP查询失败，准备TCP回退: %v", result.Error)
 		}
 	} else if result.Response != nil && result.Response.Truncated {
 		needTCPFallback = true
 		if tracker != nil {
-			tracker.AddStep("UDP响应被截断，进行TCP回退")
+			tracker.AddStep("📡 UDP响应被截断，进行TCP回退")
 		}
 	}
 
@@ -2718,7 +2727,7 @@ func (qe *QueryEngine) ExecuteQuery(ctx context.Context, msg *dns.Msg, server *U
 		if tcpErr != nil {
 			if result.Response != nil && result.Response.Rcode != dns.RcodeServerFailure {
 				if tracker != nil {
-					tracker.AddStep("TCP回退失败，使用UDP响应: %v", tcpErr)
+					tracker.AddStep("🔌 TCP回退失败，使用UDP响应: %v", tcpErr)
 				}
 				return result
 			}
@@ -2734,7 +2743,7 @@ func (qe *QueryEngine) ExecuteQuery(ctx context.Context, msg *dns.Msg, server *U
 		result.Protocol = "TCP"
 
 		if tracker != nil {
-			tracker.AddStep("TCP查询成功")
+			tracker.AddStep("🔌 TCP查询成功")
 		}
 	}
 
@@ -3516,6 +3525,7 @@ func (c *CacheEntry) ShouldRefresh() bool {
 func (c *CacheEntry) GetRemainingTTL() uint32 {
 	now := time.Now().Unix()
 	elapsed := now - c.Timestamp
+
 	remaining := int64(c.TTL) - elapsed
 
 	if remaining > 0 {
@@ -3536,6 +3546,7 @@ func (c *CacheEntry) GetRemainingTTL() uint32 {
 func (c *CacheEntry) ShouldBeDeleted() bool {
 	now := time.Now().Unix()
 	totalAge := now - c.Timestamp
+
 	return totalAge > int64(c.TTL+StaleMaxAge)
 }
 
@@ -4237,13 +4248,31 @@ func (r *RecursiveDNSServer) displayInfo() {
 	if len(servers) > 0 {
 		for _, server := range servers {
 			if server.IsRecursive() {
-				writeLog(LogInfo, "🔗 上游服务器: 递归解析 - %s", server.Policy)
+				writeLog(LogInfo, "🔗 上游服务器: 🔄 递归解析 - %s", server.Policy)
 			} else {
 				protocol := strings.ToUpper(server.Protocol)
+				emoji := ""
+				switch strings.ToLower(server.Protocol) {
+				case "udp":
+					emoji = "📡"
+				case "tcp":
+					emoji = "🔌"
+				case "tls":
+					emoji = "🔐"
+				case "quic":
+					emoji = "🚀"
+				case "https":
+					emoji = "🌐"
+				case "http3":
+					emoji = "⚡"
+				default:
+					emoji = "📡"
+				}
 				if protocol == "" {
 					protocol = "UDP"
+					emoji = "📡"
 				}
-				serverInfo := fmt.Sprintf("%s (%s) - %s", server.Address, protocol, server.Policy)
+				serverInfo := fmt.Sprintf("%s %s (%s) - %s", emoji, server.Address, protocol, server.Policy)
 				if server.SkipTLSVerify && (protocol == "TLS" || protocol == "QUIC" || protocol == "HTTPS" || protocol == "HTTP3") {
 					serverInfo += " [跳过TLS验证]"
 				}
@@ -4260,7 +4289,7 @@ func (r *RecursiveDNSServer) displayInfo() {
 	}
 
 	if r.secureDNSManager != nil {
-		writeLog(LogInfo, "🔐 监听加密端口: %s", r.config.Server.TLS.Port)
+		writeLog(LogInfo, "🔐 监听安全DNS协议端口: %s (DoT/DoQ)", r.config.Server.TLS.Port)
 
 		httpsPort := r.config.Server.TLS.HTTPS.Port
 		if httpsPort != "" {
@@ -4268,7 +4297,7 @@ func (r *RecursiveDNSServer) displayInfo() {
 			if endpoint == "" {
 				endpoint = strings.TrimPrefix(DNSServerHTTPSEndpoint, "/")
 			}
-			writeLog(LogInfo, "🌐 监听DoH/DoH3端口: %s (endpoint: /%s)", httpsPort, endpoint)
+			writeLog(LogInfo, "🌐 监听安全DNS协议端口: %s (DoH/DoH3, 端点: %s)", httpsPort, endpoint)
 		}
 	}
 
@@ -4285,7 +4314,7 @@ func (r *RecursiveDNSServer) displayInfo() {
 		writeLog(LogInfo, "🌍 默认ECS: %s/%d", defaultECS.Address, defaultECS.SourcePrefix)
 	}
 	if r.ednsManager.IsPaddingEnabled() {
-		writeLog(LogInfo, "🔒 DNS Padding: 已启用")
+		writeLog(LogInfo, "📦 DNS Padding: 已启用")
 	}
 
 	writeLog(LogInfo, "⚡ 最大并发: %d", MaxConcurrency)
@@ -4702,11 +4731,11 @@ func (r *RecursiveDNSServer) queryUpstreamServer(ctx context.Context, server *Up
 		answer, authority, additional, validated, ecsResponse, err := r.resolveWithCNAME(ctx, question, ecs, tracker)
 		result.Duration = time.Since(start)
 		result.Error = err
-		result.Protocol = "递归"
+		result.Protocol = "🔄 递归"
 
 		if err != nil {
 			if tracker != nil {
-				tracker.AddStep("递归解析失败: %v", err)
+				tracker.AddStep("🔄 递归解析失败: %v", err)
 			}
 			return result
 		}
@@ -4816,7 +4845,7 @@ func (r *RecursiveDNSServer) selectUpstreamResult(results []UpstreamResult, ques
 
 	sourceType := selectedResult.Protocol
 	if selectedResult.Server.IsRecursive() {
-		sourceType = "递归"
+		sourceType = "🔄 递归"
 	}
 
 	if tracker != nil {
