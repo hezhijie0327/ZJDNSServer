@@ -15,9 +15,11 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -71,6 +73,10 @@ const (
 	DoHReadHeaderTimeout = 5 * time.Second
 	DoHWriteTimeout      = 5 * time.Second
 	DoHMaxRequestSize    = 8192
+	DoHMaxConnsPerHost   = 2
+	DoHMaxIdleConns      = 2
+	DoHIdleConnTimeout   = 5 * time.Minute
+	DoHReadIdleTimeout   = 30 * time.Second
 )
 
 // QUIC协议相关常量
@@ -81,6 +87,7 @@ const (
 
 var NextProtoQUIC = []string{"doq", "doq-i02", "doq-i00", "dq"}
 var NextProtoHTTP3 = []string{"h3"}
+var NextProtoHTTP2 = []string{http2.NextProtoTLS, "http/1.1"}
 
 const (
 	QUICCodeNoError       quic.ApplicationErrorCode = 0
@@ -887,6 +894,8 @@ func (h *SecureConnErrorHandler) IsRetryableError(protocol string, err error) bo
 		return h.isQUICRetryableError(err)
 	case "tls":
 		return h.isTLSRetryableError(err)
+	case "https", "http3":
+		return h.isHTTPRetryableError(err)
 	default:
 		return false
 	}
@@ -954,7 +963,406 @@ func (h *SecureConnErrorHandler) isTLSRetryableError(err error) bool {
 	return errors.Is(err, io.EOF)
 }
 
+func (h *SecureConnErrorHandler) isHTTPRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// 网络超时错误
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	// QUIC相关错误
+	if h.isQUICRetryableError(err) {
+		return true
+	}
+
+	return false
+}
+
 var globalSecureConnErrorHandler = NewSecureConnErrorHandler()
+
+// ==================== DoH 客户端实现 ====================
+
+type DoHClient struct {
+	addr         *url.URL
+	tlsConfig    *tls.Config
+	client       *http.Client
+	clientMu     *sync.Mutex
+	quicConfig   *quic.Config
+	quicConfMu   *sync.Mutex
+	timeout      time.Duration
+	skipVerify   bool
+	serverName   string
+	transportH2  *http2.Transport
+	addrRedacted string
+	httpVersions []string
+	closed       int32
+}
+
+func NewDoHClient(addr, serverName string, skipVerify bool, timeout time.Duration) (*DoHClient, error) {
+	parsedURL, err := url.Parse(addr)
+	if err != nil {
+		return nil, fmt.Errorf("解析DoH地址失败: %w", err)
+	}
+
+	// 设置默认端口
+	if parsedURL.Port() == "" {
+		if parsedURL.Scheme == "https" || parsedURL.Scheme == "h3" {
+			parsedURL.Host = net.JoinHostPort(parsedURL.Host, DNSServerHTTPSPort)
+		}
+	}
+
+	// 确定HTTP版本支持
+	var httpVersions []string
+	if parsedURL.Scheme == "h3" {
+		parsedURL.Scheme = "https"
+		httpVersions = NextProtoHTTP3
+	} else {
+		httpVersions = append(NextProtoHTTP2, NextProtoHTTP3...)
+	}
+
+	if serverName == "" {
+		serverName = parsedURL.Hostname()
+	}
+
+	tlsConfig := &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: skipVerify,
+		NextProtos:         httpVersions,
+		MinVersion:         tls.VersionTLS12,
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
+	}
+
+	client := &DoHClient{
+		addr:      parsedURL,
+		tlsConfig: tlsConfig,
+		clientMu:  &sync.Mutex{},
+		quicConfig: &quic.Config{
+			KeepAlivePeriod: SecureConnKeepAlive,
+		},
+		quicConfMu:   &sync.Mutex{},
+		timeout:      timeout,
+		skipVerify:   skipVerify,
+		serverName:   serverName,
+		addrRedacted: parsedURL.Redacted(),
+		httpVersions: httpVersions,
+	}
+
+	runtime.SetFinalizer(client, (*DoHClient).Close)
+	return client, nil
+}
+
+func (c *DoHClient) Exchange(msg *dns.Msg) (*dns.Msg, error) {
+	// 保存原始ID，DoH要求使用ID=0
+	originalID := msg.Id
+	msg.Id = 0
+	defer func() {
+		msg.Id = originalID
+	}()
+
+	// 获取或创建HTTP客户端
+	httpClient, isCached, err := c.getClient()
+	if err != nil {
+		return nil, fmt.Errorf("获取HTTP客户端失败: %w", err)
+	}
+
+	// 第一次尝试
+	resp, err := c.exchangeHTTPS(httpClient, msg)
+
+	// 如果失败且是可重试错误，重新创建客户端重试
+	for i := 0; isCached && c.shouldRetry(err) && i < 2; i++ {
+		httpClient, err = c.resetClient(err)
+		if err != nil {
+			return nil, fmt.Errorf("重置HTTP客户端失败: %w", err)
+		}
+		resp, err = c.exchangeHTTPS(httpClient, msg)
+	}
+
+	if err != nil {
+		c.resetClient(err)
+		return nil, err
+	}
+
+	// 恢复原始ID
+	if resp != nil {
+		resp.Id = originalID
+	}
+
+	return resp, nil
+}
+
+func (c *DoHClient) exchangeHTTPS(client *http.Client, req *dns.Msg) (*dns.Msg, error) {
+	buf, err := req.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("打包DNS消息失败: %w", err)
+	}
+
+	// 确定HTTP方法
+	method := http.MethodGet
+	if c.isHTTP3(client) {
+		method = http3.MethodGet0RTT
+	}
+
+	// 构建请求URL
+	q := url.Values{
+		"dns": []string{base64.RawURLEncoding.EncodeToString(buf)},
+	}
+
+	u := url.URL{
+		Scheme:   c.addr.Scheme,
+		Host:     c.addr.Host,
+		Path:     c.addr.Path,
+		RawQuery: q.Encode(),
+	}
+
+	httpReq, err := http.NewRequest(method, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建HTTP请求失败: %w", err)
+	}
+
+	httpReq.Header.Set("Accept", "application/dns-message")
+	httpReq.Header.Set("User-Agent", "")
+
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("发送HTTP请求失败: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP响应错误: %d", httpResp.StatusCode)
+	}
+
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	resp := &dns.Msg{}
+	if err := resp.Unpack(body); err != nil {
+		return nil, fmt.Errorf("解析DNS响应失败: %w", err)
+	}
+
+	return resp, nil
+}
+
+func (c *DoHClient) getClient() (*http.Client, bool, error) {
+	startTime := time.Now()
+
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+
+	if c.client != nil {
+		return c.client, true, nil
+	}
+
+	// 检查超时
+	elapsed := time.Since(startTime)
+	if c.timeout > 0 && elapsed > c.timeout {
+		return nil, false, fmt.Errorf("获取客户端超时: %s", elapsed)
+	}
+
+	var err error
+	c.client, err = c.createClient()
+	return c.client, false, err
+}
+
+func (c *DoHClient) createClient() (*http.Client, error) {
+	transport, err := c.createTransport()
+	if err != nil {
+		return nil, fmt.Errorf("创建HTTP传输失败: %w", err)
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   c.timeout,
+	}, nil
+}
+
+func (c *DoHClient) createTransport() (http.RoundTripper, error) {
+	// 首先尝试创建HTTP/3传输
+	if c.supportsHTTP3() {
+		if transport, err := c.createTransportH3(); err == nil {
+			writeLog(LogDebug, "DoH客户端使用HTTP/3: %s", c.addrRedacted)
+			return transport, nil
+		} else {
+			writeLog(LogDebug, "HTTP/3连接失败，回退到HTTP/2: %v", err)
+		}
+	}
+
+	// 创建HTTP/2传输
+	if !c.supportsHTTP() {
+		return nil, errors.New("不支持HTTP/1.1或HTTP/2")
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig:    c.tlsConfig.Clone(),
+		DisableCompression: true,
+		IdleConnTimeout:    DoHIdleConnTimeout,
+		MaxConnsPerHost:    DoHMaxConnsPerHost,
+		MaxIdleConns:       DoHMaxIdleConns,
+		ForceAttemptHTTP2:  true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: c.timeout}
+			return dialer.DialContext(ctx, network, addr)
+		},
+	}
+
+	var err error
+	c.transportH2, err = http2.ConfigureTransports(transport)
+	if err != nil {
+		return nil, err
+	}
+
+	c.transportH2.ReadIdleTimeout = DoHReadIdleTimeout
+	return transport, nil
+}
+
+func (c *DoHClient) createTransportH3() (http.RoundTripper, error) {
+	// 测试QUIC连接
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	conn, err := quic.DialAddr(ctx, c.addr.Host, c.tlsConfig, c.getQUICConfig())
+	if err != nil {
+		return nil, fmt.Errorf("QUIC连接失败: %w", err)
+	}
+	conn.CloseWithError(QUICCodeNoError, "")
+
+	rt := &http3.Transport{
+		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			return quic.DialAddr(ctx, c.addr.Host, tlsCfg, cfg)
+		},
+		DisableCompression: true,
+		TLSClientConfig:    c.tlsConfig,
+		QUICConfig:         c.getQUICConfig(),
+	}
+
+	return &http3Transport{baseTransport: rt}, nil
+}
+
+func (c *DoHClient) getQUICConfig() *quic.Config {
+	c.quicConfMu.Lock()
+	defer c.quicConfMu.Unlock()
+	return c.quicConfig
+}
+
+func (c *DoHClient) resetQUICConfig() {
+	c.quicConfMu.Lock()
+	defer c.quicConfMu.Unlock()
+	c.quicConfig = &quic.Config{
+		KeepAlivePeriod: SecureConnKeepAlive,
+	}
+}
+
+func (c *DoHClient) resetClient(resetErr error) (*http.Client, error) {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+
+	if errors.Is(resetErr, quic.Err0RTTRejected) {
+		c.resetQUICConfig()
+	}
+
+	oldClient := c.client
+	if oldClient != nil {
+		c.closeClient(oldClient)
+	}
+
+	var err error
+	c.client, err = c.createClient()
+	return c.client, err
+}
+
+func (c *DoHClient) closeClient(client *http.Client) {
+	if c.isHTTP3(client) {
+		if closer, ok := client.Transport.(io.Closer); ok {
+			closer.Close()
+		}
+	} else if c.transportH2 != nil {
+		c.transportH2.CloseIdleConnections()
+	}
+}
+
+func (c *DoHClient) shouldRetry(err error) bool {
+	return globalSecureConnErrorHandler.IsRetryableError("https", err)
+}
+
+func (c *DoHClient) supportsHTTP3() bool {
+	for _, proto := range c.httpVersions {
+		if proto == "h3" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *DoHClient) supportsHTTP() bool {
+	for _, proto := range c.httpVersions {
+		if proto == http2.NextProtoTLS || proto == "http/1.1" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *DoHClient) isHTTP3(client *http.Client) bool {
+	_, ok := client.Transport.(*http3Transport)
+	return ok
+}
+
+func (c *DoHClient) Close() error {
+	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
+		return nil
+	}
+
+	runtime.SetFinalizer(c, nil)
+
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+
+	if c.client != nil {
+		c.closeClient(c.client)
+		c.client = nil
+	}
+
+	return nil
+}
+
+// ==================== HTTP/3 传输包装器 ====================
+
+type http3Transport struct {
+	baseTransport *http3.Transport
+	closed        bool
+	mu            sync.RWMutex
+}
+
+func (h *http3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.closed {
+		return nil, net.ErrClosed
+	}
+
+	// 优先使用缓存连接
+	resp, err := h.baseTransport.RoundTripOpt(req, http3.RoundTripOpt{OnlyCachedConn: true})
+	if errors.Is(err, http3.ErrNoCachedConn) {
+		resp, err = h.baseTransport.RoundTrip(req)
+	}
+
+	return resp, err
+}
+
+func (h *http3Transport) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.closed = true
+	return h.baseTransport.Close()
+}
 
 // ==================== 统一安全连接客户端 ====================
 
@@ -970,6 +1378,7 @@ type UnifiedSecureClient struct {
 	timeout         time.Duration
 	tlsConn         *tls.Conn
 	quicConn        *quic.Conn
+	dohClient       *DoHClient
 	isQUICConnected bool
 	lastActivity    time.Time
 	mutex           sync.Mutex
@@ -984,8 +1393,17 @@ func NewUnifiedSecureClient(protocol, addr, serverName string, skipVerify bool) 
 		lastActivity: time.Now(),
 	}
 
-	if err := client.connect(addr); err != nil {
-		return nil, err
+	switch client.protocol {
+	case "https", "http3":
+		var err error
+		client.dohClient, err = NewDoHClient(addr, serverName, skipVerify, SecureConnQueryTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("创建DoH客户端失败: %w", err)
+		}
+	default:
+		if err := client.connect(addr); err != nil {
+			return nil, err
+		}
 	}
 
 	return client, nil
@@ -1077,11 +1495,17 @@ func (c *UnifiedSecureClient) isConnectionAlive() bool {
 	case "quic":
 		return c.quicConn != nil && c.isQUICConnected &&
 			time.Since(c.lastActivity) <= SecureConnIdleTimeout
+	case "https", "http3":
+		return c.dohClient != nil
 	}
 	return false
 }
 
 func (c *UnifiedSecureClient) reconnectIfNeeded(addr string) error {
+	if c.protocol == "https" || c.protocol == "http3" {
+		return nil // DoH客户端自行管理连接
+	}
+
 	if c.isConnectionAlive() {
 		return nil
 	}
@@ -1096,26 +1520,31 @@ func (c *UnifiedSecureClient) reconnectIfNeeded(addr string) error {
 }
 
 func (c *UnifiedSecureClient) Exchange(msg *dns.Msg, addr string) (*dns.Msg, error) {
-	// 检查并重连（如果需要）
-	if err := c.reconnectIfNeeded(addr); err != nil {
-		return nil, fmt.Errorf("重连失败: %w", err)
-	}
-
 	switch c.protocol {
-	case "tls":
-		resp, err := c.exchangeTLS(msg)
-		// 如果是连接错误，尝试重连一次
-		if err != nil && globalSecureConnErrorHandler.isTLSRetryableError(err) {
-			writeLog(LogDebug, "TLS连接错误，尝试重连: %v", err)
-			if c.connect(addr) == nil {
-				return c.exchangeTLS(msg)
-			}
-		}
-		return resp, err
-	case "quic":
-		return c.exchangeQUIC(msg)
+	case "https", "http3":
+		return c.dohClient.Exchange(msg)
 	default:
-		return nil, fmt.Errorf("不支持的协议: %s", c.protocol)
+		// 检查并重连（如果需要）
+		if err := c.reconnectIfNeeded(addr); err != nil {
+			return nil, fmt.Errorf("重连失败: %w", err)
+		}
+
+		switch c.protocol {
+		case "tls":
+			resp, err := c.exchangeTLS(msg)
+			// 如果是连接错误，尝试重连一次
+			if err != nil && globalSecureConnErrorHandler.isTLSRetryableError(err) {
+				writeLog(LogDebug, "TLS连接错误，尝试重连: %v", err)
+				if c.connect(addr) == nil {
+					return c.exchangeTLS(msg)
+				}
+			}
+			return resp, err
+		case "quic":
+			return c.exchangeQUIC(msg)
+		default:
+			return nil, fmt.Errorf("不支持的协议: %s", c.protocol)
+		}
 	}
 }
 
@@ -1290,6 +1719,10 @@ func (c *UnifiedSecureClient) closeConnection() {
 		}
 	case "quic":
 		c.closeQUICConn()
+	case "https", "http3":
+		if c.dohClient != nil {
+			c.dohClient.Close()
+		}
 	}
 }
 
@@ -2256,7 +2689,7 @@ func (qe *QueryEngine) executeQuery(ctx context.Context, msg *dns.Msg, server *U
 	protocol := strings.ToLower(server.Protocol)
 
 	switch protocol {
-	case "tls", "quic":
+	case "tls", "quic", "https", "http3":
 		client, err := qe.connPool.GetSecureClient(protocol, server.Address, server.ServerName, server.SkipTLSVerify)
 		if err != nil {
 			return nil, fmt.Errorf("获取%s客户端失败: %w", strings.ToUpper(protocol), err)
@@ -2312,8 +2745,8 @@ func (qe *QueryEngine) ExecuteQuery(ctx context.Context, msg *dns.Msg, server *U
 
 	protocol := strings.ToLower(server.Protocol)
 
-	// 对于安全协议，直接查询不需要TCP回退
-	if protocol == "tls" || protocol == "quic" {
+	// 对于安全协议和DoH，直接查询不需要TCP回退
+	if protocol == "tls" || protocol == "quic" || protocol == "https" || protocol == "http3" {
 		result.Response, result.Error = qe.executeQuery(queryCtx, msg, server, false, tracker)
 		result.Duration = time.Since(start)
 		result.Protocol = strings.ToUpper(protocol)
@@ -2928,7 +3361,14 @@ func (cm *ConfigManager) validateUpstreamServers(servers []UpstreamServer) error
 	for i, server := range servers {
 		if !server.IsRecursive() {
 			if _, _, err := net.SplitHostPort(server.Address); err != nil {
-				return fmt.Errorf("上游服务器 %d 地址格式错误: %w", i, err)
+				// 尝试解析为URL（对于DoH/DoH3）
+				if server.Protocol == "https" || server.Protocol == "http3" {
+					if _, err := url.Parse(server.Address); err != nil {
+						return fmt.Errorf("上游服务器 %d 地址格式错误: %w", i, err)
+					}
+				} else {
+					return fmt.Errorf("上游服务器 %d 地址格式错误: %w", i, err)
+				}
 			}
 		}
 
@@ -2937,12 +3377,13 @@ func (cm *ConfigManager) validateUpstreamServers(servers []UpstreamServer) error
 			return fmt.Errorf("上游服务器 %d 信任策略无效: %s", i, server.Policy)
 		}
 
-		validProtocols := map[string]bool{"udp": true, "tcp": true, "tls": true, "quic": true}
+		validProtocols := map[string]bool{"udp": true, "tcp": true, "tls": true, "quic": true, "https": true, "http3": true}
 		if server.Protocol != "" && !validProtocols[strings.ToLower(server.Protocol)] {
 			return fmt.Errorf("上游服务器 %d 协议无效: %s", i, server.Protocol)
 		}
 
-		if (strings.ToLower(server.Protocol) == "tls" || strings.ToLower(server.Protocol) == "quic") && server.ServerName == "" {
+		protocol := strings.ToLower(server.Protocol)
+		if (protocol == "tls" || protocol == "quic" || protocol == "https" || protocol == "http3") && server.ServerName == "" {
 			return fmt.Errorf("上游服务器 %d 使用 %s 协议需要配置 server_name", i, server.Protocol)
 		}
 	}
@@ -3077,6 +3518,20 @@ func (cm *ConfigManager) GenerateExampleConfig() string {
 			Protocol:      "quic",
 			ServerName:    "dns.alidns.com",
 			SkipTLSVerify: true,
+		},
+		{
+			Address:       "https://dns.alidns.com/dns-query",
+			Policy:        "all",
+			Protocol:      "https",
+			ServerName:    "dns.alidns.com",
+			SkipTLSVerify: false,
+		},
+		{
+			Address:       "https://dns.google/dns-query",
+			Policy:        "trusted_only",
+			Protocol:      "http3",
+			ServerName:    "dns.google",
+			SkipTLSVerify: false,
 		},
 		{
 			Address: RecursiveServerIndicator,
@@ -3907,7 +4362,7 @@ func (r *RecursiveDNSServer) displayInfo() {
 					protocol = "UDP"
 				}
 				serverInfo := fmt.Sprintf("%s (%s) - %s", server.Address, protocol, server.Policy)
-				if server.SkipTLSVerify && (protocol == "TLS" || protocol == "QUIC") {
+				if server.SkipTLSVerify && (protocol == "TLS" || protocol == "QUIC" || protocol == "HTTPS" || protocol == "HTTP3") {
 					serverInfo += " [跳过TLS验证]"
 				}
 				writeLog(LogInfo, "🔗 上游服务器: %s", serverInfo)
@@ -4393,7 +4848,7 @@ func (r *RecursiveDNSServer) queryUpstreamServer(ctx context.Context, server *Up
 		}
 	} else {
 		protocol := strings.ToLower(server.Protocol)
-		isSecureConnection := (protocol == "tls" || protocol == "quic")
+		isSecureConnection := (protocol == "tls" || protocol == "quic" || protocol == "https" || protocol == "http3")
 
 		msg := r.queryEngine.BuildQuery(question, ecs, serverDNSSECEnabled, true, isSecureConnection)
 		defer r.queryEngine.ReleaseMessage(msg)
