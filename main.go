@@ -279,7 +279,7 @@ func NewRequestTracker(domain, qtype, clientIP string) *RequestTracker {
 }
 
 func (rt *RequestTracker) AddStep(step string, args ...interface{}) {
-	if logConfig.level >= LogDebug {
+	if logConfig.level >= LogDebug && rt != nil {
 		rt.mutex.Lock()
 		timestamp := time.Since(rt.StartTime).String()
 		stepMsg := fmt.Sprintf("[%s] %s", timestamp, fmt.Sprintf(step, args...))
@@ -289,14 +289,16 @@ func (rt *RequestTracker) AddStep(step string, args ...interface{}) {
 }
 
 func (rt *RequestTracker) Finish() {
-	rt.ResponseTime = time.Since(rt.StartTime)
-	if logConfig.level >= LogInfo {
-		cacheStatus := "MISS"
-		if rt.CacheHit {
-			cacheStatus = "HIT"
+	if rt != nil {
+		rt.ResponseTime = time.Since(rt.StartTime)
+		if logConfig.level >= LogInfo {
+			cacheStatus := "MISS"
+			if rt.CacheHit {
+				cacheStatus = "HIT"
+			}
+			writeLog(LogInfo, "📊 [%s] 查询完成: %s %s | 缓存:%s | 耗时:%v | 上游:%s",
+				rt.ID, rt.Domain, rt.QueryType, cacheStatus, rt.ResponseTime, rt.Upstream)
 		}
-		writeLog(LogInfo, "📊 [%s] 查询完成: %s %s | 缓存:%s | 耗时:%v | 上游:%s",
-			rt.ID, rt.Domain, rt.QueryType, cacheStatus, rt.ResponseTime, rt.Upstream)
 	}
 }
 
@@ -2770,6 +2772,7 @@ func (qe *QueryEngine) ExecuteConcurrentQuery(ctx context.Context, msg *dns.Msg,
 
 	// 启动并发查询
 	for i := 0; i < concurrency && i < len(servers); i++ {
+		// 修复：避免闭包捕获循环变量问题
 		server := servers[i]
 		qe.taskManager.ExecuteAsync(fmt.Sprintf("ConcurrentQuery-%s", server.Address),
 			func(ctx context.Context) error {
@@ -2786,7 +2789,7 @@ func (qe *QueryEngine) ExecuteConcurrentQuery(ctx context.Context, msg *dns.Msg,
 	for i := 0; i < concurrency; i++ {
 		select {
 		case result := <-resultChan:
-			if result.Error == nil && result.Response != nil {
+			if result != nil && result.Error == nil && result.Response != nil {
 				rcode := result.Response.Rcode
 				if rcode == dns.RcodeSuccess || rcode == dns.RcodeNameError {
 					if tracker != nil {
@@ -4683,6 +4686,7 @@ func (r *RecursiveDNSServer) queryUpstreamServers(question dns.Question, ecs *EC
 	ctx, cancel := context.WithTimeout(r.ctx, QueryTimeout)
 	defer cancel()
 
+	// 修复：避免闭包捕获循环变量问题
 	for i := 0; i < maxConcurrent && i < len(servers); i++ {
 		server := servers[i]
 		r.taskManager.ExecuteAsync(fmt.Sprintf("UpstreamQuery-%s", server.Address),
@@ -4781,8 +4785,8 @@ func (r *RecursiveDNSServer) queryUpstreamServer(ctx context.Context, server *Up
 			return result
 		}
 
-		if result.Response.Rcode != dns.RcodeSuccess {
-			if tracker != nil {
+		if result.Response == nil || result.Response.Rcode != dns.RcodeSuccess {
+			if tracker != nil && result.Response != nil {
 				tracker.AddStep("上游返回错误: %s", dns.RcodeToString[result.Response.Rcode])
 			}
 			return result
@@ -4836,11 +4840,14 @@ func (r *RecursiveDNSServer) selectUpstreamResult(results []UpstreamResult, ques
 		tracker.AddStep("有效结果: %d, 可信结果: %d", len(validResults), len(trustedResults))
 	}
 
+	// 修复：添加边界检查
 	var selectedResult UpstreamResult
 	if len(trustedResults) > 0 {
 		selectedResult = trustedResults[0]
-	} else {
+	} else if len(validResults) > 0 {
 		selectedResult = validResults[0]
+	} else {
+		return nil, nil, nil, false, nil, errors.New("没有可选择的查询结果")
 	}
 
 	sourceType := selectedResult.Protocol
@@ -5196,6 +5203,7 @@ func (r *RecursiveDNSServer) resolveNSAddressesConcurrent(ctx context.Context, n
 	resolveCtx, resolveCancel := context.WithTimeout(ctx, StandardOperationTimeout)
 	defer resolveCancel()
 
+	// 修复：避免闭包捕获循环变量问题
 	for i := 0; i < resolveCount; i++ {
 		ns := nsRecords[i]
 		r.taskManager.ExecuteAsync(fmt.Sprintf("NSResolve-%s", ns.Ns),
