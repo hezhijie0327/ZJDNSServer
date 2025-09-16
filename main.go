@@ -2679,6 +2679,14 @@ func (qe *QueryEngine) executeQuery(ctx context.Context, msg *dns.Msg, server *U
 }
 
 func (qe *QueryEngine) ExecuteQuery(ctx context.Context, msg *dns.Msg, server *UpstreamServer, tracker *RequestTracker) *QueryResult {
+	// 添加安全检查
+	if server == nil {
+		return &QueryResult{
+			Error:    fmt.Errorf("server is nil"),
+			Duration: 0,
+		}
+	}
+
 	start := time.Now()
 	result := &QueryResult{
 		Server:   server.Address,
@@ -5153,6 +5161,7 @@ func (r *RecursiveDNSServer) queryNameserversConcurrent(ctx context.Context, nam
 		return nil, ctx.Err()
 	}
 
+	// 修复：确保并发数不超过实际nameserver数量
 	concurrency := len(nameservers)
 	if concurrency > SingleQueryMaxConcurrency {
 		concurrency = SingleQueryMaxConcurrency
@@ -5165,8 +5174,9 @@ func (r *RecursiveDNSServer) queryNameserversConcurrent(ctx context.Context, nam
 	msg := r.queryEngine.BuildQuery(question, ecs, r.config.Server.Features.DNSSEC, false, false)
 	defer r.queryEngine.ReleaseMessage(msg)
 
+	// 修复：只创建实际需要数量的服务器，避免nil元素
 	tempServers := make([]*UpstreamServer, concurrency)
-	for i := 0; i < concurrency && i < len(nameservers); i++ {
+	for i := 0; i < concurrency; i++ {
 		protocol := "udp"
 		if forceTCP {
 			protocol = "tcp"
