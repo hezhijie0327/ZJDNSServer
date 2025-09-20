@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,7 +55,11 @@ func (r *RecursiveDNSServer) QueryForRefresh(question dns.Question, ecs *ECSOpti
 
 	servers := r.upstreamManager.GetServers()
 	if len(servers) > 0 {
-		return r.queryUpstreamServers(question, ecs, serverDNSSECEnabled, nil)
+		answer, authority, additional, validated, ecsResponse, err := r.queryUpstreamServers(question, ecs, serverDNSSECEnabled, nil, nil, "")
+		if err != nil {
+			return r.resolveWithCNAME(refreshCtx, question, ecs, nil)
+		}
+		return answer, authority, additional, validated, ecsResponse, nil
 	} else {
 		return r.resolveWithCNAME(refreshCtx, question, ecs, nil)
 	}
@@ -74,7 +80,7 @@ func NewDNSServer(config *ServerConfig) (*RecursiveDNSServer, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	ednsManager, err := NewEDNSManager(config.Server.DefaultECS, config.Server.Features.Padding)
+	ednsManager, err := NewEDNSManager(config.Server.DefaultECS, config.Server.Features.Padding, config.Server.Features.Cookie)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("🌍 EDNS管理器初始化失败: %w", err)
@@ -361,21 +367,110 @@ func (r *RecursiveDNSServer) displayInfo() {
 }
 
 func (r *RecursiveDNSServer) handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
-	defer func() { handlePanicWithContext("DNS请求处理") }()
+	defer func() {
+		if err := recover(); err != nil {
+			writeLog(LogError, "💥 DNS请求处理恐慌: %v\n%s", err, string(debug.Stack()))
+		}
+	}()
 
-	select {
-	case <-r.ctx.Done():
-		return
-	default:
+	// 获取客户端地址信息
+	clientAddr := w.RemoteAddr()
+	var clientIP net.IP
+
+	// 从客户端地址提取IP
+	if addr, ok := clientAddr.(*net.UDPAddr); ok {
+		clientIP = addr.IP
+	} else if addr, ok := clientAddr.(*net.TCPAddr); ok {
+		clientIP = addr.IP
 	}
 
-	response := r.ProcessDNSQuery(req, GetClientIP(w), false)
+	// 判断是否为安全连接
+	isSecureConnection := clientAddr != nil &&
+		(strings.Contains(clientAddr.String(), ":853") ||
+			strings.Contains(clientAddr.String(), ":443"))
+
+	// 检查是否存在无效的Cookie
+	if r.config.Server.Features.Cookie {
+		if opt := req.IsEdns0(); opt != nil {
+			for _, option := range opt.Option {
+				if cookieOpt, ok := option.(*dns.EDNS0_COOKIE); ok {
+					// 检查Cookie是否有效
+					clientCookie := cookieOpt.Cookie
+					if clientCookie != "" {
+						// 解码cookie检查基本格式
+						if _, err := hex.DecodeString(clientCookie); err != nil {
+							writeLog(LogDebug, "🍪 客户端发送了格式无效的Cookie，返回BADCOOKIE")
+							// 构造BADCOOKIE响应
+							response := new(dns.Msg)
+							response.SetRcode(req, 23) // BADCOOKIE
+							if err := w.WriteMsg(response); err != nil {
+								writeLog(LogError, "💥 DNS响应发送失败: %v", err)
+							}
+							return
+						}
+
+						// 检查长度
+						cookieBytes, _ := hex.DecodeString(clientCookie)
+						if len(cookieBytes) < 8 || (len(cookieBytes) > 8 && len(cookieBytes) < 24) || len(cookieBytes) > 24 {
+							writeLog(LogDebug, "🍪 客户端发送了长度无效的Cookie (%d 字节)，返回BADCOOKIE", len(cookieBytes))
+							// 构造BADCOOKIE响应
+							response := new(dns.Msg)
+							response.SetRcode(req, 23) // BADCOOKIE
+							if err := w.WriteMsg(response); err != nil {
+								writeLog(LogError, "💥 DNS响应发送失败: %v", err)
+							}
+							return
+						}
+
+						// 如果长度为24字节，验证服务器Cookie部分
+						if len(cookieBytes) == 24 {
+							// 交给processDNSCookie处理，如果返回false则返回BADCOOKIE
+							_, valid := r.ednsManager.processDNSCookie(clientAddr, clientCookie)
+							if !valid {
+								writeLog(LogDebug, "🍪 客户端发送了无效的完整Cookie，返回BADCOOKIE")
+								// 构造BADCOOKIE响应
+								response := new(dns.Msg)
+								response.SetRcode(req, 23) // BADCOOKIE
+								// 添加客户端Cookie到响应中
+								clientPart := clientCookie[:16]
+								serverCookie := r.ednsManager.generateServerCookie(cookieBytes[:8], clientAddr)
+								finalCookie := clientPart + serverCookie
+
+								// 添加EDNS0选项
+								opt := new(dns.OPT)
+								opt.Hdr.Name = "."
+								opt.Hdr.Rrtype = dns.TypeOPT
+								opt.SetUDPSize(ClientUDPBufferSizeBytes)
+
+								cookieOption := &dns.EDNS0_COOKIE{
+									Code:   dns.EDNS0COOKIE,
+									Cookie: finalCookie,
+								}
+								opt.Option = append(opt.Option, cookieOption)
+								response.Extra = append(response.Extra, opt)
+
+								if err := w.WriteMsg(response); err != nil {
+									writeLog(LogError, "💥 DNS响应发送失败: %v", err)
+								}
+								return
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	response := r.processDNSRequest(req, clientIP, clientAddr, isSecureConnection)
+
 	if response != nil {
-		_ = w.WriteMsg(response)
+		if err := w.WriteMsg(response); err != nil {
+			writeLog(LogError, "💥 DNS响应发送失败: %v", err)
+		}
 	}
 }
 
-func (r *RecursiveDNSServer) ProcessDNSQuery(req *dns.Msg, clientIP net.IP, isSecureConnection bool) *dns.Msg {
+func (r *RecursiveDNSServer) processDNSRequest(req *dns.Msg, clientIP net.IP, clientAddr net.Addr, isSecureConnection bool) *dns.Msg {
 	if atomic.LoadInt32(&r.closed) != 0 {
 		msg := r.buildResponse(req)
 		if msg != nil {
@@ -442,7 +537,7 @@ func (r *RecursiveDNSServer) ProcessDNSQuery(req *dns.Msg, clientIP net.IP, isSe
 
 			// 如果重写结果是IP地址，则直接返回IP响应
 			if ip := net.ParseIP(strings.TrimSuffix(rewritten, ".")); ip != nil {
-				return r.createDirectIPResponse(req, question.Qtype, ip, tracker)
+				return r.createDirectIPResponse(req, question.Qtype, ip, tracker, clientAddr)
 			}
 
 			// 否则更新问题域名继续处理
@@ -484,7 +579,7 @@ func (r *RecursiveDNSServer) ProcessDNSQuery(req *dns.Msg, clientIP net.IP, isSe
 
 	// IP地址直接响应
 	if ip := net.ParseIP(strings.TrimSuffix(question.Name, ".")); ip != nil {
-		return r.createDirectIPResponse(req, question.Qtype, ip, tracker)
+		return r.createDirectIPResponse(req, question.Qtype, ip, tracker, clientAddr)
 	}
 
 	clientRequestedDNSSEC := false
@@ -516,13 +611,13 @@ func (r *RecursiveDNSServer) ProcessDNSQuery(req *dns.Msg, clientIP net.IP, isSe
 	}
 
 	if entry, found, isExpired := r.cache.Get(cacheKey); found {
-		return r.processCacheHit(req, entry, isExpired, question, clientRequestedDNSSEC, clientHasEDNS, ecsOpt, cacheKey, tracker, isSecureConnection)
+		return r.processCacheHit(req, entry, isExpired, question, clientRequestedDNSSEC, clientHasEDNS, ecsOpt, cacheKey, tracker, isSecureConnection, clientAddr)
 	}
 
 	if tracker != nil {
 		tracker.AddStep("❌ 缓存未命中，开始查询")
 	}
-	return r.processCacheMiss(req, question, ecsOpt, clientRequestedDNSSEC, clientHasEDNS, serverDNSSECEnabled, cacheKey, tracker, isSecureConnection)
+	return r.processCacheMiss(req, question, ecsOpt, clientRequestedDNSSEC, clientHasEDNS, serverDNSSECEnabled, cacheKey, tracker, isSecureConnection, clientAddr)
 }
 
 func (r *RecursiveDNSServer) buildResponse(req *dns.Msg) *dns.Msg {
@@ -548,36 +643,43 @@ func (r *RecursiveDNSServer) buildResponse(req *dns.Msg) *dns.Msg {
 	return msg
 }
 
-func (r *RecursiveDNSServer) createDirectIPResponse(req *dns.Msg, qtype uint16, ip net.IP, tracker *RequestTracker) *dns.Msg {
-	if tracker != nil {
-		tracker.AddStep("🎯 创建直接IP响应: %s", ip.String())
-	}
+func (r *RecursiveDNSServer) createDirectIPResponse(req *dns.Msg, qtype uint16, ip net.IP, tracker *RequestTracker, clientAddr net.Addr) *dns.Msg {
+	question := req.Question[0]
 
 	msg := r.buildResponse(req)
+	if msg == nil {
+		msg = &dns.Msg{}
+		msg.SetReply(req)
+	}
 
-	// 根据查询类型和IP地址类型返回相应记录
-	if qtype == dns.TypeA && ip.To4() != nil {
-		// IPv4地址查询
-		msg.Answer = []dns.RR{&dns.A{
-			Hdr: dns.RR_Header{
-				Name:   req.Question[0].Name,
-				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET,
-				Ttl:    uint32(DefaultCacheTTLSeconds),
-			},
-			A: ip,
-		}}
-	} else if qtype == dns.TypeAAAA && ip.To4() == nil {
-		// IPv6地址查询
-		msg.Answer = []dns.RR{&dns.AAAA{
-			Hdr: dns.RR_Header{
-				Name:   req.Question[0].Name,
-				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET,
-				Ttl:    uint32(DefaultCacheTTLSeconds),
-			},
-			AAAA: ip,
-		}}
+	// 安全设置问题
+	if err := r.safeSetQuestion(msg, question.Name, question.Qtype); err != nil {
+		writeLog(LogDebug, "💥 设置DNS问题失败: %v", err)
+		msg = &dns.Msg{}
+		msg.SetQuestion(dns.Fqdn(question.Name), question.Qtype)
+	}
+
+	msg.RecursionDesired = true
+
+	if r.ednsManager != nil {
+		var clientCookie string
+		// 获取cookie选项
+		if opt := req.IsEdns0(); opt != nil {
+			for _, option := range opt.Option {
+				if cookieOpt, ok := option.(*dns.EDNS0_COOKIE); ok {
+					clientCookie = cookieOpt.Cookie
+					break
+				}
+			}
+		}
+
+		if r.config.Server.Features.Cookie {
+			// 使用带cookie的版本添加EDNS选项
+			r.ednsManager.AddToMessage(msg, nil, false, false, clientAddr, clientCookie)
+		} else {
+			// Cookie功能未启用，使用普通方法
+			r.ednsManager.AddToMessage(msg, nil, false, false, nil, clientCookie)
+		}
 	}
 	// 对于IPv4地址查询但得到IPv6地址，或IPv6地址查询但得到IPv4地址的情况，返回空答案
 
@@ -586,7 +688,7 @@ func (r *RecursiveDNSServer) createDirectIPResponse(req *dns.Msg, qtype uint16, 
 
 func (r *RecursiveDNSServer) processCacheHit(req *dns.Msg, entry *CacheEntry, isExpired bool,
 	question dns.Question, clientRequestedDNSSEC bool, clientHasEDNS bool, ecsOpt *ECSOption,
-	cacheKey string, tracker *RequestTracker, isSecureConnection bool) *dns.Msg {
+	cacheKey string, tracker *RequestTracker, isSecureConnection bool, clientAddr net.Addr) *dns.Msg {
 
 	responseTTL := entry.GetRemainingTTL()
 
@@ -627,7 +729,16 @@ func (r *RecursiveDNSServer) processCacheHit(req *dns.Msg, entry *CacheEntry, is
 		(clientRequestedDNSSEC && r.config.Server.Features.DNSSEC)
 
 	if shouldAddEDNS {
-		r.ednsManager.AddToMessage(msg, responseECS, clientRequestedDNSSEC && r.config.Server.Features.DNSSEC, isSecureConnection)
+		var clientCookie string
+		if opt := req.IsEdns0(); opt != nil {
+			for _, option := range opt.Option {
+				if cookieOpt, ok := option.(*dns.EDNS0_COOKIE); ok {
+					clientCookie = cookieOpt.Cookie
+					break
+				}
+			}
+		}
+		r.ednsManager.AddToMessage(msg, responseECS, clientRequestedDNSSEC && r.config.Server.Features.DNSSEC, isSecureConnection, clientAddr, clientCookie)
 		if tracker != nil && responseECS != nil {
 			tracker.AddStep("🌍 添加响应ECS: %s/%d", responseECS.Address, responseECS.SourcePrefix)
 		}
@@ -651,7 +762,7 @@ func (r *RecursiveDNSServer) processCacheHit(req *dns.Msg, entry *CacheEntry, is
 
 func (r *RecursiveDNSServer) processCacheMiss(req *dns.Msg, question dns.Question, ecsOpt *ECSOption,
 	clientRequestedDNSSEC bool, clientHasEDNS bool, serverDNSSECEnabled bool, cacheKey string,
-	tracker *RequestTracker, isSecureConnection bool) *dns.Msg {
+	tracker *RequestTracker, isSecureConnection bool, clientAddr net.Addr) *dns.Msg {
 
 	var answer, authority, additional []dns.RR
 	var validated bool
@@ -664,7 +775,7 @@ func (r *RecursiveDNSServer) processCacheMiss(req *dns.Msg, question dns.Questio
 			tracker.AddStep("🔗 使用上游服务器查询 (%d个可用)", len(servers))
 		}
 		answer, authority, additional, validated, ecsResponse, err = r.queryUpstreamServers(
-			question, ecsOpt, serverDNSSECEnabled, tracker)
+			question, ecsOpt, serverDNSSECEnabled, tracker, clientAddr, "")
 	} else {
 		if tracker != nil {
 			tracker.AddStep("🔄 使用递归解析")
@@ -676,16 +787,16 @@ func (r *RecursiveDNSServer) processCacheMiss(req *dns.Msg, question dns.Questio
 
 	if err != nil {
 		return r.processQueryError(req, err, cacheKey, question, clientRequestedDNSSEC,
-			clientHasEDNS, ecsOpt, tracker, isSecureConnection)
+			clientHasEDNS, ecsOpt, tracker, isSecureConnection, clientAddr)
 	}
 
 	return r.processQuerySuccess(req, question, ecsOpt, clientRequestedDNSSEC, clientHasEDNS, cacheKey,
-		answer, authority, additional, validated, ecsResponse, tracker, isSecureConnection)
+		answer, authority, additional, validated, ecsResponse, tracker, isSecureConnection, clientAddr)
 }
 
 func (r *RecursiveDNSServer) processQueryError(req *dns.Msg, err error, cacheKey string,
 	question dns.Question, clientRequestedDNSSEC bool, clientHasEDNS bool, ecsOpt *ECSOption,
-	tracker *RequestTracker, isSecureConnection bool) *dns.Msg {
+	tracker *RequestTracker, isSecureConnection bool, clientAddr net.Addr) *dns.Msg {
 
 	if tracker != nil {
 		tracker.AddStep("💥 查询失败: %v", err)
@@ -722,8 +833,24 @@ func (r *RecursiveDNSServer) processQueryError(req *dns.Msg, err error, cacheKey
 			shouldAddEDNS := clientHasEDNS || responseECS != nil || r.ednsManager.IsPaddingEnabled() ||
 				(clientRequestedDNSSEC && r.config.Server.Features.DNSSEC)
 
-			if shouldAddEDNS {
-				r.ednsManager.AddToMessage(msg, responseECS, clientRequestedDNSSEC && r.config.Server.Features.DNSSEC, isSecureConnection)
+			if r.config.Server.Features.Cookie {
+				// Cookie功能已启用
+				var clientCookie string
+
+				// 获取客户端cookie
+				if opt := req.IsEdns0(); opt != nil {
+					for _, option := range opt.Option {
+						if cookieOpt, ok := option.(*dns.EDNS0_COOKIE); ok {
+							clientCookie = cookieOpt.Cookie
+							break
+						}
+					}
+				}
+
+				r.ednsManager.AddToMessage(msg, responseECS, clientRequestedDNSSEC && r.config.Server.Features.DNSSEC, isSecureConnection, clientAddr, clientCookie)
+			} else if shouldAddEDNS {
+				// Cookie功能未启用，但有其他EDNS选项需要添加
+				r.ednsManager.AddToMessage(msg, responseECS, clientRequestedDNSSEC && r.config.Server.Features.DNSSEC, isSecureConnection, nil, "")
 			}
 
 			r.restoreOriginalDomain(msg, req.Question[0].Name, question.Name)
@@ -743,7 +870,7 @@ func (r *RecursiveDNSServer) processQueryError(req *dns.Msg, err error, cacheKey
 func (r *RecursiveDNSServer) processQuerySuccess(req *dns.Msg, question dns.Question, ecsOpt *ECSOption,
 	clientRequestedDNSSEC bool, clientHasEDNS bool, cacheKey string,
 	answer, authority, additional []dns.RR, validated bool, ecsResponse *ECSOption,
-	tracker *RequestTracker, isSecureConnection bool) *dns.Msg {
+	tracker *RequestTracker, isSecureConnection bool, clientAddr net.Addr) *dns.Msg {
 
 	if tracker != nil {
 		tracker.AddStep("✅ 查询成功: 答案=%d, 授权=%d, 附加=%d", len(answer), len(authority), len(additional))
@@ -781,13 +908,38 @@ func (r *RecursiveDNSServer) processQuerySuccess(req *dns.Msg, question dns.Ques
 	msg.Ns = globalRecordHandler.ProcessRecords(authority, 0, clientRequestedDNSSEC)
 	msg.Extra = globalRecordHandler.ProcessRecords(additional, 0, clientRequestedDNSSEC)
 
-	shouldAddEDNS := clientHasEDNS || responseECS != nil || r.ednsManager.IsPaddingEnabled() ||
-		(clientRequestedDNSSEC && r.config.Server.Features.DNSSEC)
+	// 处理EDNS选项添加，包括ECS、DNSSEC、Padding和Cookie
+	if r.config.Server.Features.Cookie {
+		// Cookie功能已启用，需要从原始请求中提取客户端cookie
+		var clientCookie string
 
-	if shouldAddEDNS {
-		r.ednsManager.AddToMessage(msg, responseECS, clientRequestedDNSSEC && r.config.Server.Features.DNSSEC, isSecureConnection)
+		// 获取客户端cookie（如果存在）
+		if opt := req.IsEdns0(); opt != nil {
+			for _, option := range opt.Option {
+				if cookieOpt, ok := option.(*dns.EDNS0_COOKIE); ok {
+					clientCookie = cookieOpt.Cookie
+					break
+				}
+			}
+		}
+
+		// 使用带cookie的版本添加EDNS选项
+		r.ednsManager.AddToMessage(msg, responseECS, clientRequestedDNSSEC && r.config.Server.Features.DNSSEC, isSecureConnection, clientAddr, clientCookie)
+
 		if tracker != nil && responseECS != nil {
 			tracker.AddStep("🌍 添加响应ECS: %s/%d", responseECS.Address, responseECS.SourcePrefix)
+		}
+	} else {
+		// Cookie功能未启用，检查是否需要添加其他EDNS选项
+		shouldAddEDNS := clientHasEDNS || responseECS != nil || r.ednsManager.IsPaddingEnabled() ||
+			(clientRequestedDNSSEC && r.config.Server.Features.DNSSEC)
+
+		if shouldAddEDNS {
+			r.ednsManager.AddToMessage(msg, responseECS, clientRequestedDNSSEC && r.config.Server.Features.DNSSEC, isSecureConnection, nil, "")
+
+			if tracker != nil && responseECS != nil {
+				tracker.AddStep("🌍 添加响应ECS: %s/%d", responseECS.Address, responseECS.SourcePrefix)
+			}
 		}
 	}
 
@@ -808,7 +960,7 @@ func (r *RecursiveDNSServer) restoreOriginalDomain(msg *dns.Msg, currentName, or
 }
 
 func (r *RecursiveDNSServer) queryUpstreamServers(question dns.Question, ecs *ECSOption,
-	serverDNSSECEnabled bool, tracker *RequestTracker) ([]dns.RR, []dns.RR, []dns.RR, bool, *ECSOption, error) {
+	serverDNSSECEnabled bool, tracker *RequestTracker, clientAddr net.Addr, clientCookie string) ([]dns.RR, []dns.RR, []dns.RR, bool, *ECSOption, error) {
 
 	servers := r.upstreamManager.GetServers()
 	if len(servers) == 0 {
@@ -816,7 +968,7 @@ func (r *RecursiveDNSServer) queryUpstreamServers(question dns.Question, ecs *EC
 	}
 
 	result, err := r.executeConcurrentQueries(r.ctx, question, ecs, serverDNSSECEnabled,
-		servers, SingleQueryMaxConcurrency, tracker)
+		servers, SingleQueryMaxConcurrency, tracker, clientAddr, clientCookie)
 	if err != nil {
 		return nil, nil, nil, false, nil, err
 	}
@@ -831,7 +983,7 @@ func (r *RecursiveDNSServer) queryUpstreamServers(question dns.Question, ecs *EC
 }
 
 func (r *RecursiveDNSServer) executeConcurrentQueries(ctx context.Context, question dns.Question, ecs *ECSOption, serverDNSSECEnabled bool,
-	servers []*UpstreamServer, maxConcurrency int, tracker *RequestTracker) (*QueryResult, error) {
+	servers []*UpstreamServer, maxConcurrency int, tracker *RequestTracker, clientAddr net.Addr, clientCookie string) (*QueryResult, error) {
 
 	if len(servers) == 0 {
 		return nil, errors.New("❌ 没有可用的服务器")
@@ -852,7 +1004,7 @@ func (r *RecursiveDNSServer) executeConcurrentQueries(ctx context.Context, quest
 		server := servers[i]
 		// 为每个并发查询创建独立的消息副本，避免数据竞争
 		// SafeCopyDNSMessage内部使用sync.Pool优化性能
-		originalMsg := r.buildQueryMessage(question, ecs, serverDNSSECEnabled, true, false)
+		originalMsg := r.buildQueryMessage(question, ecs, serverDNSSECEnabled, true, false, clientAddr, clientCookie)
 		msg := SafeCopyDNSMessage(originalMsg)
 		defer globalResourceManager.PutDNSMessage(originalMsg)
 
@@ -887,7 +1039,7 @@ func (r *RecursiveDNSServer) executeConcurrentQueries(ctx context.Context, quest
 	return nil, errors.New("💥 所有并发查询均失败")
 }
 
-func (r *RecursiveDNSServer) buildQueryMessage(question dns.Question, ecs *ECSOption, dnssecEnabled bool, recursionDesired bool, isSecureConnection bool) *dns.Msg {
+func (r *RecursiveDNSServer) buildQueryMessage(question dns.Question, ecs *ECSOption, dnssecEnabled bool, recursionDesired bool, isSecureConnection bool, clientAddr net.Addr, clientCookie string) *dns.Msg {
 	msg := globalResourceManager.GetDNSMessage()
 
 	// 确保消息状态正确
@@ -905,7 +1057,7 @@ func (r *RecursiveDNSServer) buildQueryMessage(question dns.Question, ecs *ECSOp
 	msg.RecursionDesired = recursionDesired
 
 	if r.ednsManager != nil {
-		r.ednsManager.AddToMessage(msg, ecs, dnssecEnabled, isSecureConnection)
+		r.ednsManager.AddToMessage(msg, ecs, dnssecEnabled, isSecureConnection, clientAddr, clientCookie)
 	}
 
 	return msg

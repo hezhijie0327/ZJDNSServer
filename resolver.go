@@ -316,7 +316,7 @@ func (r *RecursiveDNSServer) queryNameserversConcurrent(ctx context.Context, nam
 	}
 
 	queryResult, err := r.executeConcurrentQueries(ctx, question, ecs, r.config.Server.Features.DNSSEC,
-		tempServers, concurrency, tracker)
+		tempServers, concurrency, tracker, nil, "")
 	if err != nil {
 		return nil, err
 	}

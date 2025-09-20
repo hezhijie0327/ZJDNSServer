@@ -196,6 +196,7 @@ type ServerConfig struct {
 			HijackProtection bool `json:"hijack_protection"`
 			Padding          bool `json:"padding"`
 			IPv6             bool `json:"ipv6"`
+			Cookie           bool `json:"cookie"`
 		} `json:"features"`
 	} `json:"server"`
 

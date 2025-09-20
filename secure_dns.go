@@ -1015,7 +1015,8 @@ func (sm *SecureDNSManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := sm.server.ProcessDNSQuery(req, nil, true)
+	clientIP := sm.getSecureClientIP(r.RemoteAddr)
+	response := sm.server.processDNSRequest(req, clientIP, nil, true)
 	if err := sm.respondDoH(w, response); err != nil {
 		writeLog(LogError, "💥 DoH响应发送失败: %v", err)
 	}
@@ -1257,7 +1258,7 @@ func (sm *SecureDNSManager) handleQUICStream(stream *quic.Stream, conn *quic.Con
 	}
 
 	clientIP := sm.getSecureClientIP(conn)
-	response := sm.server.ProcessDNSQuery(req, clientIP, true)
+	response := sm.server.processDNSRequest(req, clientIP, nil, true)
 
 	if err := sm.respondQUIC(stream, response); err != nil {
 		writeLog(LogDebug, "💥 DoQ响应发送失败: %v", err)
@@ -1308,7 +1309,7 @@ func (sm *SecureDNSManager) handleSecureDNSConnection(conn net.Conn, protocol st
 		}
 
 		clientIP := sm.getSecureClientIP(tlsConn)
-		response := sm.server.ProcessDNSQuery(req, clientIP, true)
+		response := sm.server.processDNSRequest(req, clientIP, nil, true)
 
 		respBuf, err := response.Pack()
 		if err != nil {

@@ -15,6 +15,7 @@ const (
 	DefaultSecureDNSPort = "853"
 	DefaultHTTPSPort     = "443"
 	DefaultDNSQueryPath  = "/dns-query"
+	DefaultLogLevel      = "info"
 
 	// 特殊标识符
 	RecursiveServerIndicator = "builtin_recursive"

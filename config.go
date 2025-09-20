@@ -147,14 +147,13 @@ func (cm *ConfigManager) validateConfig(config *ServerConfig) error {
 
 func (cm *ConfigManager) getDefaultConfig() *ServerConfig {
 	config := &ServerConfig{}
-
 	config.Server.Port = DefaultDNSPort
-	config.Server.LogLevel = "info"
-	config.Server.DefaultECS = "auto"
+	config.Server.LogLevel = DefaultLogLevel
+	config.Server.DefaultECS = ""
 	config.Server.TrustedCIDRFile = ""
-	config.Server.DDR.Domain = "dns.example.com"
-	config.Server.DDR.IPv4 = "127.0.0.1"
-	config.Server.DDR.IPv6 = "::1"
+	config.Server.DDR.Domain = ""
+	config.Server.DDR.IPv4 = ""
+	config.Server.DDR.IPv6 = ""
 
 	config.Server.TLS.Port = DefaultSecureDNSPort
 	config.Server.TLS.HTTPS.Port = DefaultHTTPSPort
@@ -165,9 +164,10 @@ func (cm *ConfigManager) getDefaultConfig() *ServerConfig {
 	config.Server.Features.ServeStale = false
 	config.Server.Features.Prefetch = false
 	config.Server.Features.DNSSEC = true
-	config.Server.Features.HijackProtection = false
-	config.Server.Features.Padding = false
+	config.Server.Features.HijackProtection = true
+	config.Server.Features.Padding = true
 	config.Server.Features.IPv6 = true
+	config.Server.Features.Cookie = true
 
 	config.Redis.Address = ""
 	config.Redis.Password = ""
@@ -189,7 +189,7 @@ func LoadConfig(filename string) (*ServerConfig, error) {
 func GenerateExampleConfig() string {
 	config := globalConfigManager.getDefaultConfig()
 
-	config.Server.LogLevel = "info"
+	config.Server.LogLevel = "debug"
 	config.Server.DefaultECS = "auto"
 	config.Server.TrustedCIDRFile = "trusted_cidr.txt"
 
@@ -201,8 +201,6 @@ func GenerateExampleConfig() string {
 	config.Redis.Address = "127.0.0.1:6379"
 	config.Server.Features.ServeStale = true
 	config.Server.Features.Prefetch = true
-	config.Server.Features.HijackProtection = true
-	config.Server.Features.Padding = false
 
 	config.Upstream = []UpstreamServer{
 		{
